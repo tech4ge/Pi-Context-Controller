@@ -109,9 +109,16 @@ agent_before_settle:
                            Usage now X% (was Y%)."
 ```
 
-The notice instructs the agent that pruned content must be re-fetched, not recalled. Reminder tiers are *not* re-armed by pruning (only compaction re-arms); usage simply drops and future tiers cross later, or not.
-
-**Conditional re-engagement** (measured economics, slice A/B): the notice re-engages actively (`triggerTurn`) only while usage is still above ~70% — when the agent is about to keep working and must not answer from memory of pruned content. At comfortable usage the forced acknowledgment is pure cost: it pays the full cache-invalidation reprocess (observed ~163K tokens on a real slice) for a one-line reply, and is the reason an end-of-session prune showed no in-session payoff. Delivered passively instead, a late-session prune is nearly free savings for a resumed session (the invalidation is absorbed by the cold-start reprocess) — the decision of whether to prune at session end belongs to the agent (see the skill's late-session guidance: it depends on whether the session resumes and where the project keeps its durable state).
+**Mid-run application (supersedes the boundary/notice flow).** Prune edits no longer pass through
+`agent_before_settle` drafts or a post-settle notice: the `prune_context` handler appends
+`context_edit` entries directly via `sessionManager.appendContextEdit()` and the tool result
+itself is the notification ("applied immediately; your next request is built without them").
+Each turn's model request is rebuilt from the branch, so the agent's next call in the same run
+projects through the tombstones. The boundary-draft path and the conditional re-engagement
+notice (triggerTurn above ~70%) were retired with this change — see Appendix A for the
+spike evidence and the measured economics that motivated both. Reminder tiers are *not*
+re-armed by pruning (only compaction re-arms); usage simply drops and future tiers cross
+later, or not.
 
 ## 7. Toggle & configuration
 

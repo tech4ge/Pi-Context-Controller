@@ -11,7 +11,7 @@ Agent-driven context management for [pi](https://github.com/earendil-works/pi): 
 | Approval gate | Optional Yes/No dialog shown to the user **before** an agent-requested compaction runs, including the agent's proposed compaction instructions | ✅ shipped |
 | Threshold reminders | One-line usage notices injected into the conversation at configurable percentages | ✅ shipped |
 | Judgment layer | `context-discipline` skill — the firing rubric for when to prune, compact, or propose a new session | ✅ shipped |
-| Selective pruning | `prune_context` tool — agent-judged eviction of stale tool results via pi's `context_edit` (tombstones, guardrails, deferred apply) | ✅ shipped |
+| Selective pruning | `prune_context` tool — agent-judged eviction of stale tool results via pi's `context_edit` (tombstones, guardrails, mid-run apply) | ✅ shipped |
 | JSONL session logging | Per-turn token/cache/cost samples, prune & compaction history, session summaries → `~/.pi/agent/logs/context-controller.jsonl` | ✅ shipped |
 | Flash-model compaction | Compaction summarization via a cheap-but-capable model (e.g. GLM 5.3 Flash while the session runs 5.3) | 📋 backlog — see design doc §10 Phase 4 |
 | User commands | `/context-status`, `/context-config` | ✅ shipped |
@@ -40,7 +40,7 @@ The design is evidence-driven. The key findings that shaped it, with sources:
 
 **Recency is an unusually strong predictor in prefix-cache workloads.** A 20-billion-token production-trace study of 14 eviction policies (*When Fancy Eviction Fails*, arXiv 2609.28870) found simple recency/LRU surprisingly robust for prefix caching, with headroom mainly from compute-aware and workload-aware signals. → The token-tail recency blanket is the baseline protection, extended by reference liveness (future-use awareness, cf. *KVFlow*) rather than positional age alone.
 
-**Boundary-time, batch eviction beats per-turn mutation.** *TokenPilot* (Findings of EMNLP 2026) frames the same trade-off we hit — unconstrained sequence mutations destroy prompt-cache continuity — and offloads content on a conservative batch-turn schedule only when task relevance expires. → Pruning applies once, at the run boundary, agent-selected.
+**Batch eviction at agent-judged moments beats per-turn mutation.** *TokenPilot* (Findings of EMNLP 2026) frames the same trade-off we hit — unconstrained sequence mutations destroy prompt-cache continuity — and offloads content on a conservative schedule only when task relevance expires. → Pruning is episodic (sub-task boundaries, threshold crossings) and agent-selected, never per-turn; when it fires, edits apply immediately mid-run.
 [arXiv 2606.23525]
 
 **Cheap-but-capable models are competitive compactors.** A 6×6 Gemini compactor/evaluator matrix found small/cheap models competitive with Pro tiers (gemini-2.0-flash the best production compactor, ~105% retention — directional, n=5); patchpress found the *cheapest* model tested posted the top score on a 595K→23.5K handoff compaction (10/10 semantic judge, 4.4 s); Acon preserved >95% accuracy when distilling its compressor to a smaller model. → Flash-tier compaction (not nano-tier) is a sound default; hence the Phase 4 hook.
@@ -53,11 +53,11 @@ The through-line: **the agent, not a threshold policy, is the decision-maker** �
 
 ## Design notes
 
-- **Deferred triggers.** `compact_context` (and the planned `prune_context`) never act mid-run — pi's compaction aborts the in-flight turn. Requests are held and executed at `agent_before_settle`, the designed boundary for appending entries. The agent finishes its response normally, the action runs, and a notice re-engages it with the result.
+- **Deferred compaction, immediate pruning.** `compact_context` never acts mid-run — pi's compaction aborts the in-flight turn — so requests are held and executed at `agent_before_settle`, and a notice re-engages the agent with the result. `prune_context` applies immediately, mid-run: `appendContextEdit` is a public session-manager method (spike-verified; [design doc Appendix A](docs/PRUNING_DESIGN.md)), and each turn's request is rebuilt from the branch, so the very next model call projects through the tombstones.
 - **Auto-compaction untouched.** Pi's built-in threshold compaction remains the safety net. The approval gate applies only to agent-requested compactions — user `/compact` and automatic compactions are not gated.
 - **Custom instructions, not custom summaries.** The agent's `preserve` string is passed to pi's own summarizer via `customInstructions`, reusing pi's full compaction machinery (cut points, cumulative file tracking, summary format).
 - **Tombstones, not omissions (pruning).** Evicted entries are replaced with a short `[pruned: … re-run the tool if needed]` marker, so the model keeps the *fact* of having read something while explicitly losing the *content* — preventing confident hallucination from half-remembered context. Results whose file changed since the read say so explicitly in the tombstone.
-- **Episodic, not continuous.** Every history edit invalidates the prompt-cache prefix from that point forward. Pruning is therefore a boundary-time activity (sub-task completion, threshold crossings), never per-turn.
+- **Episodic, not continuous.** Every history edit invalidates the prompt-cache prefix from that point forward — pruning is timed to agent-judged moments (sub-task completion, threshold crossings), never per-turn. The invalidation is paid deliberately at the moment the agent chose it, and amortizes across the turns that follow.
 - **Dedicated config file.** Config lives in `.pi/context-controller.json` (user + project layers), not `.pi/settings.json`, because pi's settings schema is host-owned; unknown keys carry no stability guarantee.
 
 ## How prune protection works (in plain terms)
@@ -127,7 +127,7 @@ Run `/context-config` to see the effective values and which files they came from
   "pruneProtectTailTokens": 20000,    // token-tail floor: this much newer content is never prunable
   "pruneMinCallAge": 15,              // nothing offered until this many tool results are newer
   "pruneMinTokens": 400,              // entries below this are not worth an edit
-  "pruneMaxPerPass": 12               // max entries pruned per boundary
+  "pruneMaxPerPass": 12               // max entries pruned per pass
 }
 ```
 
@@ -150,7 +150,7 @@ Deferred by design: the compaction runs when the current run settles. If approve
 
 ### `prune_context`
 
-Called with no arguments: a size-ranked report of stale tool results (superseded reads, dead files, old command output) with reclaimable-token estimates and what is protected. Called with a selection: the entries are tombstoned at the run boundary. No approval gate — reversible by design. See [How prune protection works](#how-prune-protection-works-in-plain-terms) above and [docs/PRUNING_DESIGN.md](docs/PRUNING_DESIGN.md) for the full specification.
+Called with no arguments: a size-ranked report of stale tool results (superseded reads, dead files, old command output) with reclaimable-token estimates and what is protected. Called with a selection: the entries are tombstoned **immediately, mid-run** — the agent's next request is built without them (the tool result itself is the notification; no separate re-engagement turn). No approval gate — reversible by design. See [How prune protection works](#how-prune-protection-works-in-plain-terms) above and [docs/PRUNING_DESIGN.md](docs/PRUNING_DESIGN.md) for the full specification.
 
 ## Commands
 

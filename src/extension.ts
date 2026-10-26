@@ -17,7 +17,7 @@
  * (user defaults) and `<project>/.pi/context-controller.json` (project overrides).
  */
 
-import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { estimateTokens, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -33,7 +33,7 @@ import {
 	type PruneSelectionParams,
 } from "./prune.ts";
 import { autoCompactionThresholdPercent, digestBranch, formatStatus } from "./status.ts";
-import { reminderText, shouldReEngage } from "./reminders.ts";
+import { reminderText } from "./reminders.ts";
 import {
 	buildFaultState,
 	createFaultState,
@@ -50,10 +50,19 @@ interface PendingCompaction {
 	requestedAt: number;
 }
 
-/** A prune selection awaiting the run boundary. */
-interface PendingPrune {
-	candidates: PruneCandidate[];
-	requestedAt: number;
+/**
+ * The live session manager pi hands extensions is typed ReadonlySessionManager —
+ * a type-level facade over the same runtime object, which implements
+ * appendContextEdit (spike-verified; see docs/PRUNING_DESIGN.md Appendix A).
+ * This is the single place the extension steps past the declared read-only
+ * *type* surface: appending context_edit entries mid-run from the
+ * prune_context handler. If pi ever exposes this officially, delete this.
+ */
+interface EditCapableSessionManager {
+	appendContextEdit(
+		targetId: string,
+		replacement: { content: string | { type: "text"; text: string }[] } | null,
+	): string;
 }
 
 /** Running totals for the session_summary log event. */
@@ -93,8 +102,8 @@ const REMINDER_CUSTOM_TYPE = "context-controller-reminder";
 const NOTICE_CUSTOM_TYPE = "context-controller";
 
 export default function (pi: ExtensionAPI) {
-	// Session-scoped state. Cleared on session_start; pending is consumed by the
-	// agent_before_settle handler.
+	// Session-scoped state. Cleared on session_start; compaction is consumed by the
+	// agent_before_settle handler (approval flow).
 	let pendingCompaction: PendingCompaction | undefined;
 	/** Reminder tiers that have already fired (once_per_tier mode). */
 	const firedTiers = new Set<number>();
@@ -102,16 +111,10 @@ export default function (pi: ExtensionAPI) {
 	let logger: Logger | undefined;
 	/** Running session totals. */
 	let sessionStats = emptyStats();
-	/** Prune selection awaiting the run boundary. */
-	let pendingPrune: PendingPrune | undefined;
-	/** Compaction held until prune edits are persisted (edits first, compaction last). */
-	let deferredCompact: PendingCompaction | undefined;
 	/** Fault tracker for pruning: pins paths whose eviction caused a re-fetch. */
 	let faultState = createFaultState();
 	/** Branch length at the last fault scan (turn_end). */
 	let lastFaultScanIndex = 0;
-	/** Summary of the prune applied at the last boundary, for the post-settle notice. */
-	let lastPrunedForNotice: { entries: number; estimatedTokens: number; labels: string[]; percentBefore: number | null } | undefined;
 
 	/** Log one JSONL event if logging is enabled. Never throws. */
 	function log(ctx: ExtensionContext, event: string, payload: Record<string, unknown> = {}) {
@@ -278,7 +281,7 @@ export default function (pi: ExtensionAPI) {
 		name: "prune_context",
 		label: "Prune Context",
 		description:
-			"Selectively evict stale tool results from context. Called with no arguments (or listOnly), returns a size-ranked report of prune candidates (superseded file reads, stale command output) with estimated reclaimable tokens. Select with entryIds, files+keepLatest, or allCandidates. Pruning is cheaper and safer than compaction: results are replaced with tombstones and can be re-fetched by re-running the tool. Runs when your current run settles, like compact_context.",
+			"Selectively evict stale tool results from context. Called with no arguments (or listOnly), returns a size-ranked report of prune candidates (superseded file reads, stale command output) with estimated reclaimable tokens. Select with entryIds, files+keepLatest, or allCandidates. Pruning is cheaper and safer than compaction: results are replaced with tombstones and can be re-fetched by re-running the tool. Applies immediately, mid-run — your next request is built without the pruned content.",
 		promptSnippet: "Evict stale tool results from context (tombstoned, re-fetchable)",
 		promptGuidelines: [
 			"Call with no arguments first to see candidates — never prune blind.",
@@ -363,8 +366,6 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// Only the latest request is kept — the model should not stack prunes.
-			pendingPrune = { candidates: selected, requestedAt: Date.now() };
 			const estTokens = selected.reduce((sum, c) => sum + c.sizeTokens, 0);
 			log(ctx, "prune_requested", {
 				cappedOut,
@@ -374,17 +375,63 @@ export default function (pi: ExtensionAPI) {
 				entries: selected.map((c) => ({ entryId: c.entryId, label: c.label, sizeTokens: c.sizeTokens })),
 			});
 
+			// Apply immediately, mid-run. appendContextEdit() is a public
+			// session-manager method (spike-verified — see PRUNING_DESIGN.md
+			// Appendix A): each turn's model request is rebuilt from the branch,
+			// so the agent's NEXT request in this very run projects through the
+			// tombstones. This is what makes pruning amortize in single-prompt
+			// mega-runs, which have exactly one boundary: run end.
+			const branchForFaults = ctx.sessionManager.getBranch() as import("./prune.ts").PruneEntry[];
+			registerPruned(faultState, branchForFaults, selected);
+			const editSession = ctx.sessionManager as unknown as EditCapableSessionManager;
+			const applied: PruneCandidate[] = [];
+			let appendError: string | undefined;
+			for (const candidate of selected) {
+				try {
+					editSession.appendContextEdit(candidate.entryId, {
+						content: [{ type: "text", text: buildTombstone(candidate) }],
+					});
+					applied.push(candidate);
+				} catch (error) {
+					appendError = appendError ?? String((error as Error)?.message ?? error);
+				}
+			}
+			const appliedTokens = applied.reduce((sum, c) => sum + c.sizeTokens, 0);
+			sessionStats.prunes += 1;
+			sessionStats.pruneReclaimedTokens += appliedTokens;
+			log(ctx, "prune_applied", {
+				applied: "mid-run",
+				entries: applied.length,
+				estimatedTokens: appliedTokens,
+				tokensBefore: usage?.tokens ?? null,
+				percentBefore: usage?.percent ?? null,
+				labels: applied.map((c) => c.label),
+				...(appendError ? { appendError } : {}),
+			});
+
+			if (appendError) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Prune partially applied: ${applied.length}/${selected.length} entries tombstoned, then appendContextEdit failed: ${appendError}. The applied edits stand (already in effect); re-run prune_context to retry the remainder.`,
+						},
+					],
+					details: { kind: "partial-error", applied, error: appendError },
+					isError: true,
+				};
+			}
+
 			const rejectedText = rejected.length > 0 ? ` Rejected (not pruned): ${rejected.map((r) => r.entryId).join(", ")}.` : "";
 			const cappedText = cappedOut > 0 ? ` Per-pass cap: ${cappedOut} smaller entries were held back and remain candidates for a later pass.` : "";
 			return {
 				content: [
 					{
 						type: "text",
-						text:
-							`Prune requested: ${selected.length} entr${selected.length === 1 ? "y" : "ies"}, ~${estTokens.toLocaleString()} tokens est. It will apply when this run settles — finish your current response normally. Pruned content is tombstoned; re-run the tools if you need it again.${rejectedText}${cappedText}`,
+						text: `Pruned ${applied.length} entr${applied.length === 1 ? "y" : "ies"} (~${appliedTokens.toLocaleString()} tokens est.) — applied immediately; your next request is built without them. Pruned content is tombstoned — re-run the tools if you need it; do not answer from memory of it.${rejectedText}${cappedText}`,
 					},
 				],
-				details: { kind: "success", selected, rejected },
+				details: { kind: "success", selected, rejected, editCount: applied.length },
 			};
 		},
 	});
@@ -425,46 +472,15 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("agent_before_settle", async (_event, ctx) => {
-		// 1. Prune edits first (cheaper, reversible) — returned as boundary drafts.
-		const prune = pendingPrune;
-		pendingPrune = undefined;
-		let drafts: SessionBoundaryDraft[] = [];
-		if (prune && prune.candidates.length > 0) {
-			const usageBefore = ctx.getContextUsage();
-			drafts = prune.candidates.map((candidate) => ({
-				type: "context_edit",
-				targetId: candidate.entryId,
-				replacement: { content: [{ type: "text", text: buildTombstone(candidate) }] },
-			}));
-			const estTokens = prune.candidates.reduce((sum, c) => sum + c.sizeTokens, 0);
-			// Register evicted entries with the fault tracker (content hashes
-			// for fault detection) before the edits are drafted.
-			const branchForFaults = ctx.sessionManager.getBranch() as import("./prune.ts").PruneEntry[];
-			registerPruned(faultState, branchForFaults, prune.candidates);
-			sessionStats.prunes += 1;
-			sessionStats.pruneReclaimedTokens += estTokens;
-			lastPrunedForNotice = {
-				entries: prune.candidates.length,
-				estimatedTokens: estTokens,
-				labels: prune.candidates.map((c) => c.label),
-				percentBefore: usageBefore?.percent ?? null,
-			};
-			log(ctx, "prune_applied", {
-				entries: prune.candidates.length,
-				estimatedTokens: estTokens,
-				tokensBefore: usageBefore?.tokens ?? null,
-				percentBefore: usageBefore?.percent ?? null,
-				labels: prune.candidates.map((c) => c.label),
-			});
-		}
-
-		// 2. Compaction last — and if prune edits are pending, the ctx.compact()
-		// call is deferred to agent_settled so it runs against the branch WITH
-		// the edits persisted (the summarizer sees tombstones, not stale content).
+		// Compaction approval + execution at the boundary. Prune edits no
+		// longer pass through here: they are applied mid-run by the
+		// prune_context handler (see PRUNING_DESIGN.md Appendix A), so by the
+		// time this fires they are already persisted on the branch — the
+		// summarizer sees tombstones, not stale content, with no deferral.
 		const request = pendingCompaction;
 		pendingCompaction = undefined;
 		if (!request) {
-			return drafts.length > 0 ? { entries: drafts } : undefined;
+			return undefined;
 		}
 
 		const { config } = loadConfig(ctx.cwd);
@@ -493,57 +509,11 @@ export default function (pi: ExtensionAPI) {
 				"The user DECLINED the proposed compaction. Do not immediately re-request the same compaction. Either continue with less context pressure (delegate large reads to subagents, use structural lookups instead of full reads, summarize state to durable files) or ask the user whether they would prefer to start a new session.",
 				{ triggerTurn: true },
 			);
-			return drafts.length > 0 ? { entries: drafts } : undefined;
+			return undefined;
 		}
 		log(ctx, "compaction_approved", { percent: usage?.percent ?? null });
-
-		if (drafts.length > 0) {
-			// Prune edits pending: hold the compaction until they are persisted.
-			deferredCompact = request;
-			return { entries: drafts };
-		}
-
 		runCompaction(ctx, request.preserve);
 		return undefined;
-	});
-
-	// Deferred compaction (after prune edits are persisted at settle) and the
-	// post-prune re-engagement notice.
-	pi.on("agent_settled", async (_event, ctx) => {
-		const compact = deferredCompact;
-		deferredCompact = undefined;
-
-		if (compact) {
-			sendNotice(
-				"Prune edits applied; compaction starting now (edits persisted first so the summarizer sees tombstones, not stale content).",
-			);
-			runCompaction(ctx, compact.preserve);
-			return;
-		}
-
-		// Standalone prune (no compaction): report and re-engage. Usage is
-		// measurable immediately after edits (unlike after compaction).
-		const lastPrune = lastPrunedForNotice;
-		lastPrunedForNotice = undefined;
-		if (lastPrune) {
-			const usage = ctx.getContextUsage();
-			// Note: after context_edits, pi's usage measurement falls back to its
-			// estimator (the API anchor is invalidated), so a before/after percent
-			// comparison mixes bases. Report the after-percent and the estimated
-			// reclaim; the next model response re-anchors to real token counts.
-			const usageLine =
-				usage?.percent !== null && usage?.percent !== undefined
-					? ` Usage now ~${usage.percent}% (estimate-basis; re-anchors to measured tokens on the next response).`
-					: "";
-			// Re-engage actively only while pressure is still material; at
-			// comfortable usage the forced acknowledgment would pay the cache
-			// invalidation for a one-line reply (see shouldReEngage).
-			const reEngage = shouldReEngage(usage?.percent ?? null);
-			sendNotice(
-				`Pruned ${lastPrune.entries} entr${lastPrune.entries === 1 ? "y" : "ies"} (~${lastPrune.estimatedTokens.toLocaleString()} tokens est.): ${lastPrune.labels.join("; ")}.${usageLine} Pruned content is tombstoned — re-run the tools if you need it; do not answer from memory of it.`,
-				{ triggerTurn: reEngage },
-			);
-		}
 	});
 
 	// ---------------------------------------------------------------------------
@@ -704,9 +674,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		pendingCompaction = undefined;
-		pendingPrune = undefined;
-		deferredCompact = undefined;
-		lastPrunedForNotice = undefined;
 		firedTiers.clear();
 		sessionStats = emptyStats();
 		logger = undefined;
