@@ -527,9 +527,13 @@ export default function (pi: ExtensionAPI) {
 		lastPrunedForNotice = undefined;
 		if (lastPrune) {
 			const usage = ctx.getContextUsage();
+			// Note: after context_edits, pi's usage measurement falls back to its
+			// estimator (the API anchor is invalidated), so a before/after percent
+			// comparison mixes bases. Report the after-percent and the estimated
+			// reclaim; the next model response re-anchors to real token counts.
 			const usageLine =
 				usage?.percent !== null && usage?.percent !== undefined
-					? ` Usage now ${usage.percent}% (was ${lastPrune.percentBefore ?? "unknown"}%).`
+					? ` Usage now ~${usage.percent}% (estimate-basis; re-anchors to measured tokens on the next response).`
 					: "";
 			sendNotice(
 				`Pruned ${lastPrune.entries} entr${lastPrune.entries === 1 ? "y" : "ies"} (~${lastPrune.estimatedTokens.toLocaleString()} tokens est.): ${lastPrune.labels.join("; ")}.${usageLine} Pruned content is tombstoned — re-run the tools if you need it; do not answer from memory of it.`,
