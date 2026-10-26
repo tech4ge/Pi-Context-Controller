@@ -1,0 +1,26 @@
+{
+  "name": "pi-context-controller",
+  "version": "0.1.0",
+  "description": "Agent-driven context management for Pi: context awareness, agent-initiated compaction with an approval gate, and threshold reminders",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./src/extension.ts"],
+    "skills": ["./resources/skills/context-discipline"]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
