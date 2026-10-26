@@ -33,7 +33,7 @@ import {
 	type PruneSelectionParams,
 } from "./prune.ts";
 import { autoCompactionThresholdPercent, digestBranch, formatStatus } from "./status.ts";
-import { reminderText } from "./reminders.ts";
+import { reminderText, shouldReEngage } from "./reminders.ts";
 import {
 	buildFaultState,
 	createFaultState,
@@ -535,9 +535,13 @@ export default function (pi: ExtensionAPI) {
 				usage?.percent !== null && usage?.percent !== undefined
 					? ` Usage now ~${usage.percent}% (estimate-basis; re-anchors to measured tokens on the next response).`
 					: "";
+			// Re-engage actively only while pressure is still material; at
+			// comfortable usage the forced acknowledgment would pay the cache
+			// invalidation for a one-line reply (see shouldReEngage).
+			const reEngage = shouldReEngage(usage?.percent ?? null);
 			sendNotice(
 				`Pruned ${lastPrune.entries} entr${lastPrune.entries === 1 ? "y" : "ies"} (~${lastPrune.estimatedTokens.toLocaleString()} tokens est.): ${lastPrune.labels.join("; ")}.${usageLine} Pruned content is tombstoned — re-run the tools if you need it; do not answer from memory of it.`,
-				{ triggerTurn: true },
+				{ triggerTurn: reEngage },
 			);
 		}
 	});

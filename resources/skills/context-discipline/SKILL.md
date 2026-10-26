@@ -42,6 +42,8 @@ Call it when:
 
 Call it with **no arguments first** — review the candidate report before selecting. Select by `entryIds`, by `files` with `keepLatest`, or `allCandidates` when the whole report is clearly stale.
 
+**Late-session prunes — check where the payoff lives.** A prune near the end of a session only pays off if the session will be resumed or more turns will run after it: the reclaim (and its one-time cache invalidation) needs future turns to amortize against. If the session's state is already in durable files and the next session starts fresh, a final prune is wasted cost — let it end. If the session will be resumed, a prune at the very end is nearly free savings: the invalidation is absorbed by the cold-start reprocess the resumption pays anyway, and every resumed turn carries less. Judge from the project's own conventions — some projects keep state in files, others in the session itself.
+
 ## When to call `compact_context`
 
 Compaction replaces the *entire* history with a summary — for when structure itself is too large (long reasoning chains, sprawling conversations that pruning can't fix).

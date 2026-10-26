@@ -111,6 +111,8 @@ agent_before_settle:
 
 The notice instructs the agent that pruned content must be re-fetched, not recalled. Reminder tiers are *not* re-armed by pruning (only compaction re-arms); usage simply drops and future tiers cross later, or not.
 
+**Conditional re-engagement** (measured economics, slice A/B): the notice re-engages actively (`triggerTurn`) only while usage is still above ~70% — when the agent is about to keep working and must not answer from memory of pruned content. At comfortable usage the forced acknowledgment is pure cost: it pays the full cache-invalidation reprocess (observed ~163K tokens on a real slice) for a one-line reply, and is the reason an end-of-session prune showed no in-session payoff. Delivered passively instead, a late-session prune is nearly free savings for a resumed session (the invalidation is absorbed by the cold-start reprocess) — the decision of whether to prune at session end belongs to the agent (see the skill's late-session guidance: it depends on whether the session resumes and where the project keeps its durable state).
+
 ## 7. Toggle & configuration
 
 **Yes — `pruningEnabled` (default `true`).** Reasons:

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { reminderText } from "@/reminders";
+import { reminderText, shouldReEngage } from "@/reminders";
 
 describe("reminderText", () => {
 	it("prefixes every reminder with the controller tag and percentage", () => {
@@ -39,5 +39,21 @@ describe("reminderText", () => {
 	it("omits the prune line when no summary is given", () => {
 		const text = reminderText(72, 70);
 		expect(text).not.toContain("reclaimable");
+	});
+});
+
+describe("shouldReEngage", () => {
+	it("re-engages only while pressure is material", () => {
+		expect(shouldReEngage(75)).toBe(true);
+		expect(shouldReEngage(85)).toBe(true);
+	});
+
+	it("delivers passively when the prune bought room", () => {
+		expect(shouldReEngage(45)).toBe(false);
+		expect(shouldReEngage(70)).toBe(false); // at the threshold, not above it
+	});
+
+	it("defaults to passive when usage is unmeasurable", () => {
+		expect(shouldReEngage(null)).toBe(false);
 	});
 });
