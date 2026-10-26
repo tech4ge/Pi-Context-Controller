@@ -258,3 +258,55 @@ Age is reported in **tool calls** (`50 calls ago`) plus wall-clock minutes for h
 4. `extension.ts`: wire fault scan at `turn_end`, pin exclusion, `prune_fault` log event, `session_summary` fields, cap in tool execute, reminder call-site updates
 5. Verify: full suite + live RPC session exercising read → prune → forced re-read (fault logged, path pinned, excluded from next report) and an edit-then-reread (unpinned)
 6. Docs: README (done), this section; commit
+
+## Appendix A — Mid-run application (spike-verified)
+
+**Status: verified by throwaway spike (2026-10-26, /tmp/spike/midrun/ — transient). Evidence below. Not yet wired into the extension.**
+
+The boundary-only application rule (§6) was framed as a structural limit: prune requests
+identified mid-run could only apply at `agent_before_settle`, so single-prompt mega-runs
+(one boundary: session end) forfeited most of the prune's amortization. Measured across
+three Maestro slices: requests at 30-50% applied 27-33 minutes later at run end, leaving
+0-5 turns to amortize the cache-invalidation reprocess.
+
+**The capability was there all along.** `SessionManager.appendContextEdit(targetId, replacement)`
+is a public method on the session manager — an object every extension already holds
+(`ctx.sessionManager`, documented in pi's extensions.md). pi's own callers are the
+`agent_before_settle` draft path and an internal edit path; nothing restricts extensions
+from calling it directly, mid-run, inside a tool handler. Each turn's model request is
+rebuilt from the branch (`prepareRequest` → `buildSessionProjection()`), and pi itself
+mutates the branch mid-run the same way (auto-compaction between responses).
+
+**Spike design**: one run, one prompt — (1) read a marker file, (2) call a test tool whose
+handler appends a `context_edit` tombstone over the read's toolResult **directly, mid-handler**,
+(3) model continues and reports what the read result shows.
+
+**Results — all criteria passed:**
+- **Append**: `appendContextEdit` succeeded mid-handler; entry landed on the branch
+  (7→8 entries) with correct parent chain; projection reflected the tombstone immediately.
+- **Next request**: the model's next turn within the same run saw the tombstone in the read
+  result and *not* the original — confirmed by the model's own report after re-reading the
+  file from disk (it saw the original via `bash cat`, the tombstone in the read result).
+- **Run integrity**: the run continued cleanly for 3+ further turns; no crash or corruption.
+- **Ordering wrinkle resolved**: the edit entry lands on the branch *before* the tool result
+  of the tool that requested it (results append after handlers return); the projection
+  handled `…toolcalls, context_edit, tool_result` ordering without issue (edits target
+  older entries).
+- **Replay**: a fresh pi process on the session file rebuilt the projection correctly and
+  reported the tombstone verbatim.
+
+**Residual risk (untested)**: interaction with pi's auto-compaction threshold estimation
+when mid-branch edits exist — but this uses the same `estimateProjectedContextTokens`
+path as boundary-applied edits, which is already exercised in production.
+
+**Implications for the extension** (implementation sketch, not yet built):
+- `prune_context` stops stashing `pendingPrune` drafts; the handler appends the edits
+  directly and returns "applied, continue" — the tool result becomes the notification,
+  making the post-prune notice machinery (and its triggerTurn question) unnecessary for prunes.
+- The cache-invalidation reprocess is paid at the *next turn* instead of session end —
+  which is the entire point: mid-run amortization (~19K absent from each of ~200 turns
+  vs one-time reprocess at 30%).
+- The `agent_before_settle` draft path can be retired for prunes (compaction flow unchanged).
+- Fault pinning, protection model, and telemetry are unaffected (all computed from the branch).
+
+## Appendix
