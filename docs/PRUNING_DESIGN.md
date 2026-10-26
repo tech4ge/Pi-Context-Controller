@@ -198,6 +198,7 @@ Post-action notices close the loop: the prune notice names what was evicted (so 
 - **Phase 1 — logging: ✅ SHIPPED.** `src/logger.ts` + full event wiring; 25 vitest tests passing; verified live (config_loaded / turn_usage / session_summary written from a real run). Schema as specified in §8, plus `compaction_result` (agent-requested compactions carry the before/after/reclaimed numbers from `onComplete`).
 - **Phase 2 — prune core: ✅ SHIPPED.** `src/prune.ts` (pure candidate computation: size via injected `estimateTokens`, age in turns, superseded reads, file-edited-since-read, dead files, edited-target exclusion via branch scan), `prune_context` tool (list-only / entryIds / files+keepLatest / allCandidates; per-call `pruningEnabled` check), boundary application (context_edit tombstone drafts returned at `agent_before_settle`, before any compaction; when both are pending the `ctx.compact()` call is deferred to `agent_settled` so it runs against the edited branch), post-prune re-engagement notice, `prune_requested`/`prune_applied` log events. 38 vitest tests passing. **Live-verified end-to-end (RPC session):** big-file read → agent-listed candidates → agent-selected allCandidates → prune_applied logged (11,925 → 7,089 tokens on the next turn, estimate 5,537) → context_edit tombstone in session file → next-turn model response correctly stated the content was evicted and that it must re-fetch rather than recall.
 - **Phase 3 — teaching layer: ✅ SHIPPED.** SKILL.md rewritten to the full escalation ladder (`size → prune → compact → new session`) with a situation/action table and explicit negative rules (never prune/compact mid-derivation; never prune what the current task references; never `allCandidates` blindly; never answer from memory of pruned content — re-fetch; never re-request a declined compaction). Reminder text (now a pure, tested module `src/reminders.ts`) teaches prune-before-compact at high tiers and appends actionable candidate info ("N prune candidates, ~X tokens reclaimable") only when candidates actually exist and pruning is enabled; `reminder_fired` log events carry `candidateCount`/`candidateTokens`. Tool guidelines cross-reference the ladder (compact_context now points to prune first). Live-verified in an RPC session: reminder fired at 3.04% with `candidateCount: 1, candidateTokens: 5537` and the candidate line in the delivered message.
+- **Phase 2.5 — working-set protection model: ✅ SHIPPED.** §12 implemented in full: token-tail floor + logical-time maturity (`pruneMinCallAge`) replace turn-age entirely; reference liveness with path normalization and ancestor/descendant matching; superseded bypass (never past the floor); per-pass cap; edited-since-read tombstone warning; `src/faults.ts` fault tracker (content-hash matching, pin-on-fault, unpin-on-change, cross-process reconstruction from the branch + JSONL-seeded pins); `prune_fault`/`prune_unpinned` log events; `session_summary` gains `prunes`, `pruneReclaimedTokens`, `pruneFaults`, `faultReReadTokens`, `netReclaimedTokens`. 57 vitest tests. Component-verified against real branch data (sub-millisecond per pass) and live-verified end-to-end: read → prune (11,741 tokens before, 1 edit) → identical re-read → `prune_fault` logged and costed (5,537 tokens) → path pinned → excluded from the next candidate report. The E2E script initially "hung" because the test config's 100-token tail correctly protected the only (newest) result — the tail floor doing its job — which is now documented behavior: the newest ~`pruneProtectTailTokens` of results are always protected.
 - **Phase 4 (backlog) — flash-model compaction hook.** Intercept `session_before_compact`, summarize via `ctx.modelRegistry` with a cheap-but-capable model (e.g. GLM 5.3 Flash while the session runs 5.3), using the preservation focus as the summarizer rubric. Evidence: flash-tier compactors are competitive with flagships in reported matrices, and fast summarization is the difference between compaction helping (+12.3pp when it completes) and being useless (Bud: benefits vanished under time budget at 161 s/summary). Pi's official `custom-compaction.ts` example demonstrates the exact API.
 
 Spike caveat worth remembering: a fire-and-forget `ctx.compact()` from `agent_settled` is aborted if the process exits immediately (one-shot `-p` mode). Interactive/RPC sessions are unaffected — the re-engagement notice pattern handles it there.
@@ -210,3 +211,48 @@ Spike caveat worth remembering: a fire-and-forget `ctx.compact()` from `agent_se
 - Pruned content is only recoverable if its source still exists; the default tool set (filesystem-backed only) plus the toggle bound this risk.
 - The agent may still occasionally misjudge staleness — the failure mode is a re-read (bounded, cheap), never data loss.
 - Entries stay in the session file (append-only tree); pruning reduces model context, not disk size.
+
+## 12. Phase 2.5 — working-set protection model (v2)
+
+Supersedes the *turn-age aspects* of §4 (the two-tier model, tombstones, and guardrail philosophy are unchanged). Motivation: adversarial review + literature (see README citations) showed user-turn age is the wrong protection clock — one user turn can span 100 tool calls, making pruning unavailable in exactly the long dev sessions that need it; and naive eviction without fault tracking thrashes at 97% fault rates in production.
+
+### 12.1 Protection model (replaces `pruneProtectTurns`)
+
+A tool result is **offered as a candidate** only if ALL of:
+
+1. **Outside the token-tail floor** — walking tool results newest → oldest, entries are protected until cumulative estimated size exceeds `pruneProtectTailTokens` (default 20,000, mirroring pi's `keepRecentTokens` philosophy; also bounds the cache-invalidation cost of any pass).
+2. **Mature in logical time** — at least `pruneMinCallAge` (default 15) tool results newer than it. Closes the burst-of-big-reads hole where three 10K reads blow through the tail instantly.
+3. **≥ `pruneMinTokens`** estimated size (unchanged).
+4. **Not already edited** — `context_edit` branch scan (unchanged).
+5. **Not pinned by the fault tracker** (§12.2).
+6. **Not live by reference** — its normalized path is not *related* to any path touched inside the tail window (reads/edits/greps): related means equal, ancestor, or descendant (a `grep src/` protects reads of `src/foo.ts`; a read of `src/` stays live while files inside it are worked on).
+   - **Superseded bypass**: an older read whose path has a newer read still in context bypasses rule 6 (a redundant copy exists) but never rules 1–2.
+   - **Path normalization**: lexically resolved against session cwd (`path.resolve`/`path.normalize`) before comparison; `./src/foo.ts` == `src/foo.ts` == absolute. Symlinks explicitly out of scope (documented).
+
+Age is reported in **tool calls** (`50 calls ago`) plus wall-clock minutes for humans (`47 min`) — timestamps get a reporting role, not a policy role. Rationale (README "How prune protection works"): wall-clock measures idleness, not use; a session's clock ticks on work, and the costs being managed are denominated in tokens.
+
+### 12.2 Fault tracking & pinning
+
+- At prune-apply time, record per entry: `{ targetId, toolName, normalizedPath, contentHash }` (hash of the original result content — the entry remains in the session tree after `context_edit`, so this is reconstructable cross-process by scanning `context_edit` entries and their targets).
+- **Fault detection**: a later tool call with the same tool name + same path arguments whose result hashes *identically* → the agent re-fetched exactly what was evicted. Log `prune_fault` `{ path, toolName, ageCallsSincePrune }`; **pin** the path (excluded from all future candidate sets).
+- **Unpin** when a subsequent result for the path hashes *differently* — the file changed, the eviction was correct (per the demand-paging paper's false-pin guard).
+- Detection point: scan new tool-result entries at `turn_end` (index-tracked since last scan; no new event dependencies).
+- **Honest metrics**: `session_summary` gains `pruneFaults` and `netReclaimedTokens` (reclaimed − estimated fault re-read cost), so churn can never masquerade as savings.
+
+### 12.3 Per-pass cap and tombstone honesty
+
+- `pruneMaxPerPass` (default 12): selections are capped largest-first; the overflow stays a candidate for later passes; `allCandidates` respects the cap; capped count is returned to the agent and logged.
+- Edited-since-read tombstones carry: *"...a re-read returns the CURRENT file content, not what you saw when this was originally read."*
+
+### 12.4 Config changes
+
+`pruneProtectTurns` is removed (nothing deployed elsewhere — clean rename). New fields: `pruneProtectTailTokens` (20000), `pruneMinCallAge` (15), `pruneMaxPerPass` (12). A config file still containing `pruneProtectTurns` produces a warning that it is obsolete and ignored.
+
+### 12.5 Build plan
+
+1. `config.ts`: new fields + obsolete-field warning (+ tests)
+2. `prune.ts`: protection rewrite — normalization, tail floor, liveness with ancestor/descendant matching, call age, superseded bypass, cap, age-in-calls reporting, edited-since-read tombstone warning (+ test rewrite: tail boundaries, burst+minCallAge, alias/dir liveness, superseded-bypass-not-floor, cap)
+3. `faults.ts` (new): pure fault-index build/scan/match/pin logic (+ tests: fault on identical hash, unpin on change, cross-process reconstruction from a session file)
+4. `extension.ts`: wire fault scan at `turn_end`, pin exclusion, `prune_fault` log event, `session_summary` fields, cap in tool execute, reminder call-site updates
+5. Verify: full suite + live RPC session exercising read → prune → forced re-read (fault logged, path pinned, excluded from next report) and an edit-then-reread (unpinned)
+6. Docs: README (done), this section; commit

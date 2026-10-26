@@ -19,6 +19,8 @@
 
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { estimateTokens, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { Type } from "typebox";
 import { loadConfig } from "./config.ts";
 import { createLogger, type Logger } from "./logger.ts";
@@ -32,6 +34,14 @@ import {
 } from "./prune.ts";
 import { autoCompactionThresholdPercent, digestBranch, formatStatus } from "./status.ts";
 import { reminderText } from "./reminders.ts";
+import {
+	buildFaultState,
+	createFaultState,
+	pinnedKeys,
+	registerPruned,
+	scanForFaults,
+	seedPins,
+} from "./faults.ts";
 
 /** A compaction requested via the compact_context tool, awaiting the run boundary. */
 interface PendingCompaction {
@@ -56,6 +66,10 @@ interface SessionStats {
 	totalCost: number;
 	compactions: number;
 	compactionTokensReclaimed: number;
+	prunes: number;
+	pruneReclaimedTokens: number;
+	pruneFaults: number;
+	faultReReadTokens: number;
 }
 
 function emptyStats(): SessionStats {
@@ -68,6 +82,10 @@ function emptyStats(): SessionStats {
 		totalCost: 0,
 		compactions: 0,
 		compactionTokensReclaimed: 0,
+		prunes: 0,
+		pruneReclaimedTokens: 0,
+		pruneFaults: 0,
+		faultReReadTokens: 0,
 	};
 }
 
@@ -88,6 +106,10 @@ export default function (pi: ExtensionAPI) {
 	let pendingPrune: PendingPrune | undefined;
 	/** Compaction held until prune edits are persisted (edits first, compaction last). */
 	let deferredCompact: PendingCompaction | undefined;
+	/** Fault tracker for pruning: pins paths whose eviction caused a re-fetch. */
+	let faultState = createFaultState();
+	/** Branch length at the last fault scan (turn_end). */
+	let lastFaultScanIndex = 0;
 	/** Summary of the prune applied at the last boundary, for the post-settle notice. */
 	let lastPrunedForNotice: { entries: number; estimatedTokens: number; labels: string[]; percentBefore: number | null } | undefined;
 
@@ -106,6 +128,29 @@ export default function (pi: ExtensionAPI) {
 
 	function sendNotice(content: string, options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" }) {
 		pi.sendMessage({ customType: NOTICE_CUSTOM_TYPE, content, display: true }, options);
+	}
+
+	/** Fault keys pinned in prior processes for this session (from the JSONL log). Defensive: never throws. */
+	function readLoggedFaultKeys(sessionId: string): string[] {
+		try {
+			const logPath = join(getAgentDir(), "logs", "context-controller.jsonl");
+			if (!existsSync(logPath)) return [];
+			const keys: string[] = [];
+			for (const line of readFileSync(logPath, "utf8").split("\n")) {
+				if (!line.includes("prune_fault")) continue;
+				try {
+					const ev = JSON.parse(line) as { event?: string; sessionId?: string; key?: string };
+					if (ev.event === "prune_fault" && ev.sessionId === sessionId && typeof ev.key === "string") {
+						keys.push(ev.key);
+					}
+				} catch {
+					// partial line during a concurrent write — ignore
+				}
+			}
+			return [...new Set(keys)];
+		} catch {
+			return [];
+		}
 	}
 
 	// ---------------------------------------------------------------------------
@@ -272,7 +317,14 @@ export default function (pi: ExtensionAPI) {
 			const branch = ctx.sessionManager.getBranch() as import("./prune.ts").PruneEntry[];
 			const candidates = computePruneCandidates(
 				branch,
-				{ protectTurns: config.pruneProtectTurns, minTokens: config.pruneMinTokens },
+				{
+					protectTailTokens: config.pruneProtectTailTokens,
+					minCallAge: config.pruneMinCallAge,
+					minTokens: config.pruneMinTokens,
+					maxPerPass: config.pruneMaxPerPass,
+					cwd: ctx.cwd,
+					pinnedPaths: pinnedKeys(faultState),
+				},
 				estimateMessageTokens,
 			);
 			const usage = ctx.getContextUsage();
@@ -280,12 +332,28 @@ export default function (pi: ExtensionAPI) {
 			const hasSelection = params.allCandidates || params.entryIds || params.files;
 			if (!hasSelection || params.listOnly) {
 				return {
-					content: [{ type: "text", text: renderCandidateReport(candidates, { protectTurns: config.pruneProtectTurns, minTokens: config.pruneMinTokens }, usage?.tokens ?? null) }],
+					content: [
+						{
+							type: "text",
+							text: renderCandidateReport(
+								candidates,
+								{
+									protectTailTokens: config.pruneProtectTailTokens,
+									minCallAge: config.pruneMinCallAge,
+									minTokens: config.pruneMinTokens,
+									maxPerPass: config.pruneMaxPerPass,
+								},
+								usage?.tokens ?? null,
+							),
+						},
+					],
 					details: { kind: "success", candidates },
 				};
 			}
 
-			const { selected, rejected } = resolvePruneSelection(candidates, params);
+			const { selected, rejected, cappedOut } = resolvePruneSelection(candidates, params, {
+				maxPerPass: config.pruneMaxPerPass,
+			});
 			if (selected.length === 0) {
 				const rejectionText = rejected.length > 0 ? ` Rejections: ${rejected.map((r) => `${r.entryId} (${r.reason})`).join("; ")}` : "";
 				return {
@@ -299,6 +367,7 @@ export default function (pi: ExtensionAPI) {
 			pendingPrune = { candidates: selected, requestedAt: Date.now() };
 			const estTokens = selected.reduce((sum, c) => sum + c.sizeTokens, 0);
 			log(ctx, "prune_requested", {
+				cappedOut,
 				count: selected.length,
 				estimatedTokens: estTokens,
 				percent: usage?.percent ?? null,
@@ -306,12 +375,13 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			const rejectedText = rejected.length > 0 ? ` Rejected (not pruned): ${rejected.map((r) => r.entryId).join(", ")}.` : "";
+			const cappedText = cappedOut > 0 ? ` Per-pass cap: ${cappedOut} smaller entries were held back and remain candidates for a later pass.` : "";
 			return {
 				content: [
 					{
 						type: "text",
 						text:
-							`Prune requested: ${selected.length} entr${selected.length === 1 ? "y" : "ies"}, ~${estTokens.toLocaleString()} tokens est. It will apply when this run settles — finish your current response normally. Pruned content is tombstoned; re-run the tools if you need it again.${rejectedText}`,
+							`Prune requested: ${selected.length} entr${selected.length === 1 ? "y" : "ies"}, ~${estTokens.toLocaleString()} tokens est. It will apply when this run settles — finish your current response normally. Pruned content is tombstoned; re-run the tools if you need it again.${rejectedText}${cappedText}`,
 					},
 				],
 				details: { kind: "success", selected, rejected },
@@ -367,6 +437,12 @@ export default function (pi: ExtensionAPI) {
 				replacement: { content: [{ type: "text", text: buildTombstone(candidate) }] },
 			}));
 			const estTokens = prune.candidates.reduce((sum, c) => sum + c.sizeTokens, 0);
+			// Register evicted entries with the fault tracker (content hashes
+			// for fault detection) before the edits are drafted.
+			const branchForFaults = ctx.sessionManager.getBranch() as import("./prune.ts").PruneEntry[];
+			registerPruned(faultState, branchForFaults, prune.candidates);
+			sessionStats.prunes += 1;
+			sessionStats.pruneReclaimedTokens += estTokens;
 			lastPrunedForNotice = {
 				entries: prune.candidates.length,
 				estimatedTokens: estTokens,
@@ -505,6 +581,27 @@ export default function (pi: ExtensionAPI) {
 			});
 		}
 
+		// Fault scan: detect re-fetches of evicted content in entries added
+		// since the last scan. Pins the path on identical content (fault),
+		// unpins on changed content. Independent of reminders.
+		{
+			const branch = ctx.sessionManager.getBranch() as import("./prune.ts").PruneEntry[];
+			const scanFrom = Math.min(lastFaultScanIndex, branch.length);
+			if (scanFrom < branch.length) {
+				const { events, nextIndex } = scanForFaults(faultState, branch, scanFrom, estimateMessageTokens, ctx.cwd);
+				lastFaultScanIndex = nextIndex;
+				for (const event of events) {
+					if (event.kind === "fault") {
+						sessionStats.pruneFaults += 1;
+						sessionStats.faultReReadTokens += event.sizeTokens;
+						log(ctx, "prune_fault", { key: event.key, toolName: event.toolName, sizeTokens: event.sizeTokens });
+					} else {
+						log(ctx, "prune_unpinned", { key: event.key, toolName: event.toolName });
+					}
+				}
+			}
+		}
+
 		if (!config.remindersEnabled || config.reminderThresholds.length === 0) return;
 		if (!usage || usage.percent === null) return;
 
@@ -532,7 +629,13 @@ export default function (pi: ExtensionAPI) {
 		if (config.pruningEnabled) {
 			const candidates = computePruneCandidates(
 				ctx.sessionManager.getBranch() as import("./prune.ts").PruneEntry[],
-				{ protectTurns: config.pruneProtectTurns, minTokens: config.pruneMinTokens },
+				{
+					protectTailTokens: config.pruneProtectTailTokens,
+					minCallAge: config.pruneMinCallAge,
+					minTokens: config.pruneMinTokens,
+					cwd: ctx.cwd,
+					pinnedPaths: pinnedKeys(faultState),
+				},
 				estimateMessageTokens,
 			);
 			if (candidates.length > 0) {
@@ -599,6 +702,15 @@ export default function (pi: ExtensionAPI) {
 		firedTiers.clear();
 		sessionStats = emptyStats();
 		logger = undefined;
+		// Rebuild the fault tracker from this session's history: context_edit
+		// entries reconstruct evicted records (content is still in the tree),
+		// and prior-process fault events (JSONL log) seed the pins.
+		const startBranch = ctx.sessionManager.getBranch() as import("./prune.ts").PruneEntry[];
+		faultState = buildFaultState(startBranch, ctx.cwd);
+		lastFaultScanIndex = startBranch.length;
+		const sessionId = ctx.sessionManager.getSessionId();
+		const faultKeys = readLoggedFaultKeys(sessionId);
+		if (faultKeys.length > 0) seedPins(faultState, faultKeys);
 		const { config, sources, warnings } = loadConfig(ctx.cwd);
 		if (config.loggingEnabled) {
 			log(ctx, "config_loaded", { sources, warnings, config });
@@ -608,7 +720,13 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (_event, ctx) => {
 		const { config } = loadConfig(ctx.cwd);
 		if (config.loggingEnabled) {
-			log(ctx, "session_summary", { ...sessionStats });
+			log(ctx, "session_summary", {
+				...sessionStats,
+				netReclaimedTokens:
+					sessionStats.compactionTokensReclaimed +
+					sessionStats.pruneReclaimedTokens -
+					sessionStats.faultReReadTokens,
+			});
 		}
 	});
 
@@ -644,8 +762,10 @@ export default function (pi: ExtensionAPI) {
 				`loggingEnabled: ${config.loggingEnabled}`,
 				`logTurnUsage: ${config.logTurnUsage}`,
 				`pruningEnabled: ${config.pruningEnabled}`,
-				`pruneProtectTurns: ${config.pruneProtectTurns}`,
+				`pruneProtectTailTokens: ${config.pruneProtectTailTokens}`,
+				`pruneMinCallAge: ${config.pruneMinCallAge}`,
 				`pruneMinTokens: ${config.pruneMinTokens}`,
+				`pruneMaxPerPass: ${config.pruneMaxPerPass}`,
 				"",
 				sources.length > 0 ? `Config sources: ${sources.join(", ")}` : "No config files found — using defaults.",
 				"Config locations: ~/.pi/agent/context-controller.json (user), .pi/context-controller.json (project)",

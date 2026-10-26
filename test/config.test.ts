@@ -83,26 +83,31 @@ describe("prune config fields", () => {
 		mkdirSync(join(project, ".pi"), { recursive: true });
 		writeFileSync(
 			join(project, ".pi", "context-controller.json"),
-			JSON.stringify({ pruningEnabled: false, pruneProtectTurns: 3, pruneMinTokens: 1000 }),
+			JSON.stringify({ pruningEnabled: false, pruneProtectTailTokens: 8000, pruneMinCallAge: 5, pruneMinTokens: 1000, pruneMaxPerPass: 3 }),
 		);
 		const { config, warnings } = loadConfig(project);
 		expect(config.pruningEnabled).toBe(false);
-		expect(config.pruneProtectTurns).toBe(3);
+		expect(config.pruneProtectTailTokens).toBe(8000);
+		expect(config.pruneMinCallAge).toBe(5);
 		expect(config.pruneMinTokens).toBe(1000);
+		expect(config.pruneMaxPerPass).toBe(3);
 		expect(warnings).toEqual([]);
 	});
 
-	it("falls back on invalid prune fields with warnings", () => {
+	it("falls back on invalid prune fields, and warns on the obsolete turn-based field", () => {
 		const project = join(dir, "project-prune-bad");
 		mkdirSync(join(project, ".pi"), { recursive: true });
 		writeFileSync(
 			join(project, ".pi", "context-controller.json"),
-			JSON.stringify({ pruningEnabled: "yes", pruneProtectTurns: -2, pruneMinTokens: "big" }),
+			JSON.stringify({ pruningEnabled: "yes", pruneProtectTailTokens: -2, pruneMinCallAge: "soon", pruneMinTokens: "big", pruneMaxPerPass: -1, pruneProtectTurns: 5 }),
 		);
 		const { config, warnings } = loadConfig(project);
 		expect(config.pruningEnabled).toBe(true);
-		expect(config.pruneProtectTurns).toBe(5);
+		expect(config.pruneProtectTailTokens).toBe(20000);
+		expect(config.pruneMinCallAge).toBe(15);
 		expect(config.pruneMinTokens).toBe(400);
-		expect(warnings).toHaveLength(3);
+		expect(config.pruneMaxPerPass).toBe(12);
+		expect(warnings).toHaveLength(6); // 5 invalid fields + the obsolete-field warning
+		expect(warnings.some((w) => w.includes("pruneProtectTurns is obsolete"))).toBe(true);
 	});
 });

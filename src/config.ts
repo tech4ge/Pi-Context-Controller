@@ -29,10 +29,14 @@ export interface ContextControllerConfig {
 	logTurnUsage: boolean;
 	/** Register the prune_context tool (selective eviction of stale tool results). */
 	pruningEnabled: boolean;
-	/** Tool results from the last N turns are never prunable (working-set protection). */
-	pruneProtectTurns: number;
+	/** Token-tail floor: tool results within this much cumulative newer content are never prunable. */
+	pruneProtectTailTokens: number;
+	/** Nothing is offered until at least this many tool results are newer than it (logical-time maturity floor). */
+	pruneMinCallAge: number;
 	/** Tool results below this estimated size are not worth a context_edit. */
 	pruneMinTokens: number;
+	/** Maximum entries pruned per boundary (bounds cache invalidation and tombstone density). */
+	pruneMaxPerPass: number;
 }
 
 export const DEFAULT_CONFIG: ContextControllerConfig = {
@@ -43,8 +47,10 @@ export const DEFAULT_CONFIG: ContextControllerConfig = {
 	loggingEnabled: true,
 	logTurnUsage: true,
 	pruningEnabled: true,
-	pruneProtectTurns: 5,
+	pruneProtectTailTokens: 20000,
+	pruneMinCallAge: 15,
 	pruneMinTokens: 400,
+	pruneMaxPerPass: 12,
 };
 
 export interface LoadedConfig {
@@ -127,7 +133,7 @@ export function applyConfigFile(
 			}
 		}
 	}
-	for (const key of ["pruneProtectTurns", "pruneMinTokens"] as const) {
+	for (const key of ["pruneProtectTailTokens", "pruneMinCallAge", "pruneMinTokens", "pruneMaxPerPass"] as const) {
 		if (key in file) {
 			const value = file[key];
 			if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
@@ -136,6 +142,11 @@ export function applyConfigFile(
 				warnings.push(`${sourceName}: ${key} must be a non-negative number, keeping ${base[key]}`);
 			}
 		}
+	}
+	if ("pruneProtectTurns" in file) {
+		warnings.push(
+			`${sourceName}: pruneProtectTurns is obsolete (replaced by the working-set protection model) and is ignored — see docs/PRUNING_DESIGN.md §12`,
+		);
 	}
 
 	return { config: next, warnings };
