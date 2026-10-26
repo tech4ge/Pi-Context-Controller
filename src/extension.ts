@@ -31,6 +31,7 @@ import {
 	type PruneSelectionParams,
 } from "./prune.ts";
 import { autoCompactionThresholdPercent, digestBranch, formatStatus } from "./status.ts";
+import { reminderText } from "./reminders.ts";
 
 /** A compaction requested via the compact_context tool, awaiting the run boundary. */
 interface PendingCompaction {
@@ -160,6 +161,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Call compact_context when a sub-task has just resolved, or when work is converging and the detail behind you is no longer needed.",
 			"Do NOT call compact_context mid-derivation or while stuck — you may need the working detail you would be summarizing away.",
+			"Prefer prune_context first when stale tool results are the bloat; compact only when structure itself is too large.",
 			"compact_context is deferred: it runs at the end of your current run, not immediately. Finish your response after calling it.",
 		],
 		parameters: Type.Object({
@@ -464,18 +466,6 @@ export default function (pi: ExtensionAPI) {
 	// Threshold reminders
 	// ---------------------------------------------------------------------------
 
-	function reminderText(percent: number, tier: number): string {
-		const guidance =
-			tier >= 90
-				? "Auto-compaction is imminent. Wrap up the current sub-task now: write important state to durable files, then either call compact_context with a preservation focus or propose starting a new session to the user."
-				: tier >= 80
-					? "High usage. Prefer structural lookups over full file reads, delegate large reads to subagents, and consider calling compact_context with a preservation focus at the next sub-task boundary."
-					: tier >= 65
-						? "Moderate usage. Size remaining work accordingly: avoid unnecessary full-file reads and be deliberate about what you pull into context."
-						: "Context is filling. Keep this in mind when sizing upcoming reads and investigations.";
-		return `[context-controller] Context usage: ${percent}%. ${guidance}`;
-	}
-
 	pi.on("turn_end", async (event, ctx) => {
 		const { config } = loadConfig(ctx.cwd);
 
@@ -536,11 +526,30 @@ export default function (pi: ExtensionAPI) {
 
 		if (tier === undefined) return;
 
-		const message = { customType: REMINDER_CUSTOM_TYPE, content: reminderText(percent, tier), display: true };
+		// Prune nudges: only when candidates actually exist and pruning is on —
+		// actionable guidance, never noise. Computed only when a reminder fires.
+		let pruneSummary: { count: number; tokens: number } | null = null;
+		if (config.pruningEnabled) {
+			const candidates = computePruneCandidates(
+				ctx.sessionManager.getBranch() as import("./prune.ts").PruneEntry[],
+				{ protectTurns: config.pruneProtectTurns, minTokens: config.pruneMinTokens },
+				estimateMessageTokens,
+			);
+			if (candidates.length > 0) {
+				pruneSummary = {
+					count: candidates.length,
+					tokens: candidates.reduce((sum, c) => sum + c.sizeTokens, 0),
+				};
+			}
+		}
+
+		const message = { customType: REMINDER_CUSTOM_TYPE, content: reminderText(percent, tier, pruneSummary), display: true };
 		log(ctx, "reminder_fired", {
 			tier,
 			percent,
 			tokens: usage.tokens,
+			candidateCount: pruneSummary?.count ?? 0,
+			candidateTokens: pruneSummary?.tokens ?? 0,
 		});
 		if (event.continue) {
 			// Run continues: deliver before the next model request.
