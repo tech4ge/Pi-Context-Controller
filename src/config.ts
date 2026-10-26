@@ -27,6 +27,12 @@ export interface ContextControllerConfig {
 	loggingEnabled: boolean;
 	/** Include a per-turn token/cache/cost sample event at every turn end. */
 	logTurnUsage: boolean;
+	/** Register the prune_context tool (selective eviction of stale tool results). */
+	pruningEnabled: boolean;
+	/** Tool results from the last N turns are never prunable (working-set protection). */
+	pruneProtectTurns: number;
+	/** Tool results below this estimated size are not worth a context_edit. */
+	pruneMinTokens: number;
 }
 
 export const DEFAULT_CONFIG: ContextControllerConfig = {
@@ -36,6 +42,9 @@ export const DEFAULT_CONFIG: ContextControllerConfig = {
 	reminderRepeatMode: "once_per_tier",
 	loggingEnabled: true,
 	logTurnUsage: true,
+	pruningEnabled: true,
+	pruneProtectTurns: 5,
+	pruneMinTokens: 400,
 };
 
 export interface LoadedConfig {
@@ -109,12 +118,22 @@ export function applyConfigFile(
 			warnings.push(`${sourceName}: reminderRepeatMode must be "once_per_tier" or "every_turn", keeping ${base.reminderRepeatMode}`);
 		}
 	}
-	for (const key of ["loggingEnabled", "logTurnUsage"] as const) {
+	for (const key of ["loggingEnabled", "logTurnUsage", "pruningEnabled"] as const) {
 		if (key in file) {
 			if (typeof file[key] === "boolean") {
 				next[key] = file[key] as boolean;
 			} else {
 				warnings.push(`${sourceName}: ${key} must be a boolean, keeping ${base[key]}`);
+			}
+		}
+	}
+	for (const key of ["pruneProtectTurns", "pruneMinTokens"] as const) {
+		if (key in file) {
+			const value = file[key];
+			if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+				next[key] = Math.floor(value);
+			} else {
+				warnings.push(`${sourceName}: ${key} must be a non-negative number, keeping ${base[key]}`);
 			}
 		}
 	}

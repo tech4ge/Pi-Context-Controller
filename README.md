@@ -11,7 +11,7 @@ Agent-driven context management for [pi](https://github.com/earendil-works/pi): 
 | Approval gate | Optional Yes/No dialog shown to the user **before** an agent-requested compaction runs, including the agent's proposed compaction instructions | ✅ shipped |
 | Threshold reminders | One-line usage notices injected into the conversation at configurable percentages | ✅ shipped |
 | Judgment layer | `context-discipline` skill — the firing rubric for when to prune, compact, or propose a new session | ✅ shipped |
-| Selective pruning | `prune_context` tool — agent-judged eviction of stale tool results via pi's `context_edit` | 🚧 planned — see [docs/PRUNING_DESIGN.md](docs/PRUNING_DESIGN.md) |
+| Selective pruning | `prune_context` tool — agent-judged eviction of stale tool results via pi's `context_edit` (tombstones, guardrails, deferred apply) | ✅ shipped |
 | JSONL session logging | Per-turn token/cache/cost samples, prune & compaction history, session summaries → `~/.pi/agent/logs/context-controller.jsonl` | ✅ shipped |
 | Flash-model compaction | Compaction summarization via a cheap-but-capable model (e.g. GLM 5.3 Flash while the session runs 5.3) | 📋 backlog — see design doc §10 Phase 4 |
 | User commands | `/context-status`, `/context-config` | ✅ shipped |
@@ -99,7 +99,7 @@ Run `/context-config` to see the effective values and which files they came from
   "loggingEnabled": true,       // JSONL log of context events
   "logTurnUsage": true,         // per-turn token/cache/cost samples
 
-  // --- planned (see docs/PRUNING_DESIGN.md) ---
+  // --- pruning (shipped) ---
   "pruningEnabled": true,       // register/hide the prune_context tool
   "pruneProtectTurns": 5,       // last N turns are never prunable
   "pruneMinTokens": 400         // entries below this are not worth an edit

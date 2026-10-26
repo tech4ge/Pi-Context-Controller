@@ -73,3 +73,36 @@ describe("loadConfig", () => {
 		expect(sources).toEqual([]);
 	});
 });
+
+describe("prune config fields", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pcc-prune-cfg-"));
+	afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+	it("applies valid prune fields", () => {
+		const project = join(dir, "project-prune");
+		mkdirSync(join(project, ".pi"), { recursive: true });
+		writeFileSync(
+			join(project, ".pi", "context-controller.json"),
+			JSON.stringify({ pruningEnabled: false, pruneProtectTurns: 3, pruneMinTokens: 1000 }),
+		);
+		const { config, warnings } = loadConfig(project);
+		expect(config.pruningEnabled).toBe(false);
+		expect(config.pruneProtectTurns).toBe(3);
+		expect(config.pruneMinTokens).toBe(1000);
+		expect(warnings).toEqual([]);
+	});
+
+	it("falls back on invalid prune fields with warnings", () => {
+		const project = join(dir, "project-prune-bad");
+		mkdirSync(join(project, ".pi"), { recursive: true });
+		writeFileSync(
+			join(project, ".pi", "context-controller.json"),
+			JSON.stringify({ pruningEnabled: "yes", pruneProtectTurns: -2, pruneMinTokens: "big" }),
+		);
+		const { config, warnings } = loadConfig(project);
+		expect(config.pruningEnabled).toBe(true);
+		expect(config.pruneProtectTurns).toBe(5);
+		expect(config.pruneMinTokens).toBe(400);
+		expect(warnings).toHaveLength(3);
+	});
+});

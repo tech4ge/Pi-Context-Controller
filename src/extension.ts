@@ -17,17 +17,31 @@
  * (user defaults) and `<project>/.pi/context-controller.json` (project overrides).
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
+import { estimateTokens, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { loadConfig } from "./config.ts";
 import { createLogger, type Logger } from "./logger.ts";
+import {
+	buildTombstone,
+	computePruneCandidates,
+	renderCandidateReport,
+	resolvePruneSelection,
+	type PruneCandidate,
+	type PruneSelectionParams,
+} from "./prune.ts";
 import { autoCompactionThresholdPercent, digestBranch, formatStatus } from "./status.ts";
 
 /** A compaction requested via the compact_context tool, awaiting the run boundary. */
 interface PendingCompaction {
 	preserve: string;
 	reason?: string;
+	requestedAt: number;
+}
+
+/** A prune selection awaiting the run boundary. */
+interface PendingPrune {
+	candidates: PruneCandidate[];
 	requestedAt: number;
 }
 
@@ -69,6 +83,12 @@ export default function (pi: ExtensionAPI) {
 	let logger: Logger | undefined;
 	/** Running session totals. */
 	let sessionStats = emptyStats();
+	/** Prune selection awaiting the run boundary. */
+	let pendingPrune: PendingPrune | undefined;
+	/** Compaction held until prune edits are persisted (edits first, compaction last). */
+	let deferredCompact: PendingCompaction | undefined;
+	/** Summary of the prune applied at the last boundary, for the post-settle notice. */
+	let lastPrunedForNotice: { entries: number; estimatedTokens: number; labels: string[]; percentBefore: number | null } | undefined;
 
 	/** Log one JSONL event if logging is enabled. Never throws. */
 	function log(ctx: ExtensionContext, event: string, payload: Record<string, unknown> = {}) {
@@ -200,13 +220,174 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ---------------------------------------------------------------------------
+	// Selective pruning: candidates computed here, judgment applied by the agent
+	// ---------------------------------------------------------------------------
+
+	/** Estimate tokens for a structural message view via pi's own estimator. */
+	const estimateMessageTokens = (message: NonNullable<import("./prune.ts").PruneEntry["message"]>) =>
+		estimateTokens(message as Parameters<typeof estimateTokens>[0]);
+
+	pi.registerTool({
+		name: "prune_context",
+		label: "Prune Context",
+		description:
+			"Selectively evict stale tool results from context. Called with no arguments (or listOnly), returns a size-ranked report of prune candidates (superseded file reads, stale command output) with estimated reclaimable tokens. Select with entryIds, files+keepLatest, or allCandidates. Pruning is cheaper and safer than compaction: results are replaced with tombstones and can be re-fetched by re-running the tool. Runs when your current run settles, like compact_context.",
+		promptSnippet: "Evict stale tool results from context (tombstoned, re-fetchable)",
+		promptGuidelines: [
+			"Call with no arguments first to see candidates — never prune blind.",
+			"Prefer pruning over compaction when stale tool results are the bloat; compact only when structure itself is too large.",
+			"Pruned content must be re-fetched, not recalled — after a prune, re-run the tool if you need pruned content; say so rather than guessing.",
+			"Don't prune mid-derivation or entries the current task still references.",
+		],
+		parameters: Type.Object({
+			listOnly: Type.Optional(Type.Boolean({ description: "Only list candidates; do not prune (default when no selection given)." })),
+			entryIds: Type.Optional(Type.Array(Type.String(), { description: "Entry ids from the candidate report to prune." })),
+			files: Type.Optional(
+				Type.Array(
+					Type.Object({
+						path: Type.String({ description: "File path whose reads to prune." }),
+						keepLatest: Type.Optional(Type.Boolean({ description: "Keep the newest read of the path (prune only older ones)." })),
+					}),
+					{ description: "Select by file path instead of entry id." },
+				),
+			),
+			allCandidates: Type.Optional(Type.Boolean({ description: "Prune the entire current candidate report." })),
+		}),
+		async execute(_toolCallId, params: PruneSelectionParams, signal, _onUpdate, ctx) {
+			if (signal?.aborted) {
+				return { content: [{ type: "text", text: "Aborted." }], details: { kind: "aborted" } };
+			}
+
+			const { config } = loadConfig(ctx.cwd);
+			if (!config.pruningEnabled) {
+				return {
+					content: [{ type: "text", text: "Pruning is disabled in configuration (pruningEnabled: false)." }],
+					details: { kind: "disabled" },
+					isError: true,
+				};
+			}
+
+			const branch = ctx.sessionManager.getBranch() as import("./prune.ts").PruneEntry[];
+			const candidates = computePruneCandidates(
+				branch,
+				{ protectTurns: config.pruneProtectTurns, minTokens: config.pruneMinTokens },
+				estimateMessageTokens,
+			);
+			const usage = ctx.getContextUsage();
+
+			const hasSelection = params.allCandidates || params.entryIds || params.files;
+			if (!hasSelection || params.listOnly) {
+				return {
+					content: [{ type: "text", text: renderCandidateReport(candidates, { protectTurns: config.pruneProtectTurns, minTokens: config.pruneMinTokens }, usage?.tokens ?? null) }],
+					details: { kind: "success", candidates },
+				};
+			}
+
+			const { selected, rejected } = resolvePruneSelection(candidates, params);
+			if (selected.length === 0) {
+				const rejectionText = rejected.length > 0 ? ` Rejections: ${rejected.map((r) => `${r.entryId} (${r.reason})`).join("; ")}` : "";
+				return {
+					content: [{ type: "text", text: `Nothing selected to prune.${rejectionText}` }],
+					details: { kind: "validation-error", rejected },
+					isError: true,
+				};
+			}
+
+			// Only the latest request is kept — the model should not stack prunes.
+			pendingPrune = { candidates: selected, requestedAt: Date.now() };
+			const estTokens = selected.reduce((sum, c) => sum + c.sizeTokens, 0);
+			log(ctx, "prune_requested", {
+				count: selected.length,
+				estimatedTokens: estTokens,
+				percent: usage?.percent ?? null,
+				entries: selected.map((c) => ({ entryId: c.entryId, label: c.label, sizeTokens: c.sizeTokens })),
+			});
+
+			const rejectedText = rejected.length > 0 ? ` Rejected (not pruned): ${rejected.map((r) => r.entryId).join(", ")}.` : "";
+			return {
+				content: [
+					{
+						type: "text",
+						text:
+							`Prune requested: ${selected.length} entr${selected.length === 1 ? "y" : "ies"}, ~${estTokens.toLocaleString()} tokens est. It will apply when this run settles — finish your current response normally. Pruned content is tombstoned; re-run the tools if you need it again.${rejectedText}`,
+					},
+				],
+				details: { kind: "success", selected, rejected },
+			};
+		},
+	});
+
+	// ---------------------------------------------------------------------------
 	// Agent-initiated compaction: consumed at the run boundary
 	// ---------------------------------------------------------------------------
 
+	/** Shared compaction execution (used directly, and deferred after prune edits). */
+	function runCompaction(ctx: ExtensionContext, preserve: string) {
+		ctx.compact({
+			customInstructions: preserve,
+			onComplete: (result) => {
+				if (ctx.hasUI) ctx.ui.notify("Compaction completed", "info");
+				const before = result.tokensBefore;
+				const after = result.estimatedTokensAfter;
+				const reclaimed =
+					typeof before === "number" && typeof after === "number" ? before - after : null;
+				if (reclaimed && reclaimed > 0) sessionStats.compactionTokensReclaimed += reclaimed;
+				log(ctx, "compaction_result", {
+					tokensBefore: before ?? null,
+					estimatedTokensAfter: after ?? null,
+					reclaimed,
+				});
+				sendNotice(
+					`Compaction completed (${before?.toLocaleString() ?? "unknown"} → ~${after?.toLocaleString() ?? "unknown"} tokens). Your preservation focus was passed to the summarizer. Re-orient with context_status if needed, then continue your work.`,
+					{ triggerTurn: true },
+				);
+			},
+			onError: (error) => {
+				if (ctx.hasUI) ctx.ui.notify(`Compaction failed: ${error.message}`, "error");
+				sendNotice(
+					`Compaction failed: ${error.message}. Context may still be under pressure — prefer small reads and consider asking the user to start a new session.`,
+					{ triggerTurn: true },
+				);
+			},
+		});
+	}
+
 	pi.on("agent_before_settle", async (_event, ctx) => {
+		// 1. Prune edits first (cheaper, reversible) — returned as boundary drafts.
+		const prune = pendingPrune;
+		pendingPrune = undefined;
+		let drafts: SessionBoundaryDraft[] = [];
+		if (prune && prune.candidates.length > 0) {
+			const usageBefore = ctx.getContextUsage();
+			drafts = prune.candidates.map((candidate) => ({
+				type: "context_edit",
+				targetId: candidate.entryId,
+				replacement: { content: [{ type: "text", text: buildTombstone(candidate) }] },
+			}));
+			const estTokens = prune.candidates.reduce((sum, c) => sum + c.sizeTokens, 0);
+			lastPrunedForNotice = {
+				entries: prune.candidates.length,
+				estimatedTokens: estTokens,
+				labels: prune.candidates.map((c) => c.label),
+				percentBefore: usageBefore?.percent ?? null,
+			};
+			log(ctx, "prune_applied", {
+				entries: prune.candidates.length,
+				estimatedTokens: estTokens,
+				tokensBefore: usageBefore?.tokens ?? null,
+				percentBefore: usageBefore?.percent ?? null,
+				labels: prune.candidates.map((c) => c.label),
+			});
+		}
+
+		// 2. Compaction last — and if prune edits are pending, the ctx.compact()
+		// call is deferred to agent_settled so it runs against the branch WITH
+		// the edits persisted (the summarizer sees tombstones, not stale content).
 		const request = pendingCompaction;
-		if (!request) return;
 		pendingCompaction = undefined;
+		if (!request) {
+			return drafts.length > 0 ? { entries: drafts } : undefined;
+		}
 
 		const { config } = loadConfig(ctx.cwd);
 		const usage = ctx.getContextUsage();
@@ -234,37 +415,49 @@ export default function (pi: ExtensionAPI) {
 				"The user DECLINED the proposed compaction. Do not immediately re-request the same compaction. Either continue with less context pressure (delegate large reads to subagents, use structural lookups instead of full reads, summarize state to durable files) or ask the user whether they would prefer to start a new session.",
 				{ triggerTurn: true },
 			);
-			return;
+			return drafts.length > 0 ? { entries: drafts } : undefined;
 		}
 		log(ctx, "compaction_approved", { percent: usage?.percent ?? null });
 
-		ctx.compact({
-			customInstructions: request.preserve,
-			onComplete: (result) => {
-				if (ctx.hasUI) ctx.ui.notify("Compaction completed", "info");
-				const before = result.tokensBefore;
-				const after = result.estimatedTokensAfter;
-				const reclaimed =
-					typeof before === "number" && typeof after === "number" ? before - after : null;
-				if (reclaimed && reclaimed > 0) sessionStats.compactionTokensReclaimed += reclaimed;
-				log(ctx, "compaction_result", {
-					tokensBefore: before ?? null,
-					estimatedTokensAfter: after ?? null,
-					reclaimed,
-				});
-				sendNotice(
-					`Compaction completed (${before?.toLocaleString() ?? "unknown"} → ~${after?.toLocaleString() ?? "unknown"} tokens). Your preservation focus was passed to the summarizer. Re-orient with context_status if needed, then continue your work.`,
-					{ triggerTurn: true },
-				);
-			},
-			onError: (error) => {
-				if (ctx.hasUI) ctx.ui.notify(`Compaction failed: ${error.message}`, "error");
-				sendNotice(
-					`Compaction failed: ${error.message}. Context may still be under pressure — prefer small reads and consider asking the user to start a new session.`,
-					{ triggerTurn: true },
-				);
-			},
-		});
+		if (drafts.length > 0) {
+			// Prune edits pending: hold the compaction until they are persisted.
+			deferredCompact = request;
+			return { entries: drafts };
+		}
+
+		runCompaction(ctx, request.preserve);
+		return undefined;
+	});
+
+	// Deferred compaction (after prune edits are persisted at settle) and the
+	// post-prune re-engagement notice.
+	pi.on("agent_settled", async (_event, ctx) => {
+		const compact = deferredCompact;
+		deferredCompact = undefined;
+
+		if (compact) {
+			sendNotice(
+				"Prune edits applied; compaction starting now (edits persisted first so the summarizer sees tombstones, not stale content).",
+			);
+			runCompaction(ctx, compact.preserve);
+			return;
+		}
+
+		// Standalone prune (no compaction): report and re-engage. Usage is
+		// measurable immediately after edits (unlike after compaction).
+		const lastPrune = lastPrunedForNotice;
+		lastPrunedForNotice = undefined;
+		if (lastPrune) {
+			const usage = ctx.getContextUsage();
+			const usageLine =
+				usage?.percent !== null && usage?.percent !== undefined
+					? ` Usage now ${usage.percent}% (was ${lastPrune.percentBefore ?? "unknown"}%).`
+					: "";
+			sendNotice(
+				`Pruned ${lastPrune.entries} entr${lastPrune.entries === 1 ? "y" : "ies"} (~${lastPrune.estimatedTokens.toLocaleString()} tokens est.): ${lastPrune.labels.join("; ")}.${usageLine} Pruned content is tombstoned — re-run the tools if you need it; do not answer from memory of it.`,
+				{ triggerTurn: true },
+			);
+		}
 	});
 
 	// ---------------------------------------------------------------------------
@@ -391,6 +584,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		pendingCompaction = undefined;
+		pendingPrune = undefined;
+		deferredCompact = undefined;
+		lastPrunedForNotice = undefined;
 		firedTiers.clear();
 		sessionStats = emptyStats();
 		logger = undefined;
@@ -438,6 +634,9 @@ export default function (pi: ExtensionAPI) {
 				`reminderRepeatMode: ${config.reminderRepeatMode}`,
 				`loggingEnabled: ${config.loggingEnabled}`,
 				`logTurnUsage: ${config.logTurnUsage}`,
+				`pruningEnabled: ${config.pruningEnabled}`,
+				`pruneProtectTurns: ${config.pruneProtectTurns}`,
+				`pruneMinTokens: ${config.pruneMinTokens}`,
 				"",
 				sources.length > 0 ? `Config sources: ${sources.join(", ")}` : "No config files found — using defaults.",
 				"Config locations: ~/.pi/agent/context-controller.json (user), .pi/context-controller.json (project)",
