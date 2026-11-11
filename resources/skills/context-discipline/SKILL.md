@@ -26,7 +26,7 @@ size (free, always) → prune (cheap, reversible) → compact (costly, lossy) �
 | Deciding whether to read something large | `context_status` first; prefer structural lookups, targeted reads, or delegation |
 | Sub-task resolved, stale reads/output behind you | `prune_context` (list first, then select) |
 | Structure itself bloated — prune insufficient or nothing prunable | `compact_context` with explicit preservation focus |
-| 85%+ and at a natural boundary | Log state to durable files, propose new session to user |
+| 85%+ and at a natural boundary | Log state to durable files, then `handoff_session` with a complete focus brief (or propose a new session to the user if the tool is unavailable) |
 | Reminder fired mid-work | Acknowledge internally, keep working; adjust read sizing |
 | Compaction declined by user | Adapt — smaller reads, pruning, delegation, or ask about a new session |
 
@@ -73,12 +73,9 @@ Compaction is **deferred** — it runs when your current run settles, not immedi
 
 ## When to propose a new session instead
 
-Compaction is lossy. When usage is very high (85%+) **and** the current goal is complete or at a natural boundary:
+Compaction is lossy. When usage is very high (85%+) **and** the current goal is complete or at a natural boundary, `handoff_session` is the mechanism: write the state out to durable files first (project convention: kanban issue, `.scratch/`, `CONTEXT.md`, or whatever this project uses), then call it with a complete, self-contained focus brief — goal, current work state, relevant files, and the next concrete step. By default the brief is used verbatim as the new session's starting prompt (no rewriting); only pass `generate: true` if the conversation itself must be summarized.
 
-1. Write the state out to durable files first (project convention: kanban issue, `.scratch/`, `CONTEXT.md`, or whatever this project uses).
-2. Then tell the user: context is nearly full, state is logged at `<where>`, and a fresh session could pick this up cleanly.
-
-The user decides. Never start a new session on your own initiative.
+The user still reviews and approves the handoff prompt — it is deferred like compaction and runs when the current run settles. If the tool is unavailable (headless mode) or the user declines, propose a new session directly instead. Never start a new session on your own initiative.
 
 ## Negative rules
 

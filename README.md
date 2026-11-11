@@ -12,9 +12,10 @@ Agent-driven context management for [pi](https://github.com/earendil-works/pi): 
 | Threshold reminders | One-line usage notices injected into the conversation at configurable percentages | ✅ shipped |
 | Judgment layer | `context-discipline` skill — the firing rubric for when to prune, compact, or propose a new session | ✅ shipped |
 | Selective pruning | `prune_context` tool — agent-judged eviction of stale tool results via pi's `context_edit` (tombstones, guardrails, mid-run apply) | ✅ shipped |
+| Session handoff | `handoff_session` tool — agent-initiated transfer to a NEW session with a user-approved starting prompt, executed via `/handoff` | ✅ shipped |
 | JSONL session logging | Per-turn token/cache/cost samples, prune & compaction history, session summaries → `~/.pi/agent/logs/context-controller.jsonl` | ✅ shipped |
 | Flash-model compaction | Compaction summarization via a cheap-but-capable model (e.g. GLM 5.3 Flash while the session runs 5.3) | 📋 backlog — see design doc §10 Phase 4 |
-| User commands | `/context-status`, `/context-config` | ✅ shipped |
+| User commands | `/context-status`, `/context-config`, `/handoff` | ✅ shipped |
 
 ## Research & methodology
 
@@ -152,14 +153,69 @@ Deferred by design: the compaction runs when the current run settles. If approve
 
 Called with no arguments: a size-ranked report of stale tool results (superseded reads, dead files, old command output) with reclaimable-token estimates and what is protected. Called with a selection: the entries are tombstoned **immediately, mid-run** — the agent's next request is built without them (the tool result itself is the notification; no separate re-engagement turn). No approval gate — reversible by design. See [How prune protection works](#how-prune-protection-works-in-plain-terms) above and [docs/PRUNING_DESIGN.md](docs/PRUNING_DESIGN.md) for the full specification.
 
+### `handoff_session`
+
+| Parameter | Required | Description |
+|---|---|---|
+| `focus` | yes | What the next session must pick up: goal, work state, relevant files, next concrete step. Used **verbatim** as the new session's starting prompt, so the agent writes it complete and self-contained. |
+| `generate` | no | Opt into generating the prompt with an LLM summary of the conversation instead of using `focus` verbatim (lossier — can truncate detail). Defaults to `false`. |
+| `reason` | no | One line on why a new session beats continuing or compacting (shown to the user). |
+
+The complement to `compact_context` for the end of a body of work: instead of summarizing the current session in place, the agent's `focus` becomes a **self-contained starting prompt** for a fresh session. Deferred like compaction — it runs when the current run settles. The flow:
+
+1. The agent calls `handoff_session` with its `focus` (e.g. after a merge gate, when the next task is materially different). By default there is **no second LLM call**: the focus is written by the agent with full live context and used verbatim, so nothing is lost to re-summarization.
+2. When `generate: true` is passed (or via `/handoff <goal>`, where a one-line goal is not a finished brief), the prompt is generated on the **physical model behind the latest assistant response** (under a virtual model like `dyna/auto`, the selected model name can't be dispatched directly — assistant messages record the physical one). Generation honours compaction boundaries, and the generator's system prompt treats the focus as authoritative verbatim content — it may only enrich, never shorten.
+3. The user reviews and edits the handoff prompt in an editor — **cancelling declines the handoff** (the approval gate; no config flag, same spirit as `confirmBeforeCompaction` but always on, since a new session is a bigger action than a compaction).
+4. The approved prompt is parked in `~/.pi/agent/handoff-pending.json`; the user runs **`/handoff`** to open the new session with the prompt as a submit-ready draft (the old session stays intact, parent-linked). The extra command exists because pi's extension API gates session switching (`newSession`) to command contexts — an event handler can prepare, but not switch.
+
+A requested handoff **supersedes** a pending compaction. Headless (non-TUI) modes decline handoffs — compaction remains available there. `prune_context` first, `compact_context` to stay, `handoff_session` to move on: the three tools are the escalation ladder.
+
 ## Commands
 
 - `/context-status` — same output as the tool, for the user
 - `/context-config` — effective configuration, sources, and warnings
+- `/handoff` — execute a parked agent handoff (no args), or generate a fresh one from a goal: `/handoff <goal for the new session>`
+
+## Project-level guidance (AGENTS.md)
+
+The extension self-documents: every tool registers its own prompt guidelines, and the bundled `context-discipline` skill (installed with the package, auto-loaded by pi) provides the judgment rubric — the prune → compact → new-session escalation ladder, when *not* to act, and how to write a preservation focus. **A project needs no AGENTS.md changes for baseline behavior.**
+
+Add project-level guidance only where the project differs from the defaults — things the skill cannot know. Good candidates:
+
+- **Where durable state lives** in this project (plans directory, issue tracker, `CONTEXT.md`), so the agent writes state there before a compaction or handoff
+- **What is expensive or risky to re-read** (large generated files, sources with side effects), or conversely what is *cheap* to re-read and should be pruned aggressively
+- **Session conventions**: whether this project prefers `handoff_session` (fresh session per task) or `compact_context` (long-running continuity)
+
+Example snippet, modelled on the real conventions already running in the working projects (see *Real examples* below):
+
+```markdown
+## Session handoff (Pi-Context-Controller)
+
+This project runs one task per session. At a merge gate or other natural boundary,
+call `handoff_session` with the session-regeneration template filled in as the
+`focus` — State, Ritual, Task, Landbank, Process + open items, Learnings. The next
+session opens with that brief verbatim; write it complete.
+
+- Durable state lives in the kanban board and the venture context packet at
+  `~/Projects/ventures/<slug>/handoff/context-packet.md` — write there before handing off.
+- Prune build output and regenerable command dumps aggressively; never prune reads
+  of files you are actively editing.
+- Use `compact_context` only to stay in-session mid-task; the handoff is the
+  session-boundary mechanism.
+```
+
+The key integration pattern: a project that already has a hand-written session-regeneration template doesn't need a new convention — the template maps 1:1 onto `handoff_session`'s `focus` parameter, and the tool becomes the mechanical carrier for the existing ritual.
+
+**Real examples in this workspace:**
+
+- `~/Projects/golden-glow-app/AGENTS.md` — "Session craft" section: one-task-one-session policy, the six-section session-regeneration template (State / Ritual / Task / Landbank / Process + open items / Learnings), and the session-start learning refresh. The template's mandatory sections are precisely the shape a `handoff_session` focus brief should have.
+- `~/Projects/labhub/AGENTS.md`, `~/Projects/content-harness/AGENTS.md` — session-start read of the venture context packet (`~/Projects/ventures/<slug>/handoff/context-packet.md`), the durable-state source a handoff brief should point at.
+
+Keep such snippets short — they consume context in every session in the project. The skill handles judgment; AGENTS.md should only supply project facts and preferences.
 
 ## Impact measurement
 
-The JSONL log (`~/.pi/agent/logs/context-controller.jsonl`) answers "what is this actually doing to token usage?" locally, per session — complementing provider-side dashboards with in-session ground truth. Each event carries `sessionId` and `cwd`. Events: `config_loaded`, `turn_usage` (per-turn tokens + cache read/write + cost), `reminder_fired`, `compaction_requested` / `compaction_approved` / `compaction_declined`, `compaction_completed` / `compaction_result` / `compaction_failed`, and a `session_summary` with totals at shutdown. The file rotates at 5 MB (one generation kept).
+The JSONL log (`~/.pi/agent/logs/context-controller.jsonl`) answers "what is this actually doing to token usage?" locally, per session — complementing provider-side dashboards with in-session ground truth. Each event carries `sessionId` and `cwd`. Events: `config_loaded`, `turn_usage` (per-turn tokens + cache read/write + cost), `reminder_fired`, `prune_requested` / `prune_applied` / `prune_fault` / `prune_unpinned` (fault = pruned entry re-fetched; the file is pinned afterwards), `compaction_requested` / `compaction_approved` / `compaction_declined`, `compaction_completed` / `compaction_result` / `compaction_failed`, `handoff_requested` (with mode: verbatim or generated) / `handoff_approved` / `handoff_declined` / `handoff_cancelled` / `handoff_unavailable` / `handoff_failed` / `handoff_executed`, and a `session_summary` with totals at shutdown. The file rotates at 5 MB (one generation kept).
 
 ```bash
 # Token + cache behavior around a prune (cache-invalidation cost is the cacheRead dip)
