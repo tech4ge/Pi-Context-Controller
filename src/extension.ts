@@ -8,6 +8,13 @@
  *     The compaction runs when the current agent run settles (never mid-run), and —
  *     when `confirmBeforeCompaction` is enabled — the user first sees the agent's
  *     proposed compaction instructions in a Yes/No approval dialog.
+ *   - `handoff_session` tool: agent-initiated handoff to a NEW session. Instead of
+ *     compacting (lossy, same session), the agent's `focus` brief becomes the new
+ *     session's starting prompt verbatim (no second LLM call — the agent writes it
+ *     with full live context); `generate: true` opts into an LLM summary instead.
+ *     The user reviews and edits the prompt, and a fresh session opens with it as a
+ *     draft — the old session stays intact, parent-linked. The user approves
+ *     by submitting the draft; cancelling the editor declines the handoff.
  *   - Threshold reminders injected into the conversation as context usage rises
  *   - JSONL logging of context decisions, per-turn usage samples, and outcomes to
  *     ~/.pi/agent/logs/context-controller.jsonl (local session deep-dives)
@@ -17,8 +24,9 @@
  * (user defaults) and `<project>/.pi/context-controller.json` (project overrides).
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { estimateTokens, getAgentDir } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { BorderedLoader, convertToLlm, estimateTokens, getAgentDir, serializeConversation } from "@earendil-works/pi-coding-agent";
+import { uuidv7 } from "@earendil-works/pi-ai";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "typebox";
@@ -32,6 +40,16 @@ import {
 	type PruneCandidate,
 	type PruneSelectionParams,
 } from "./prune.ts";
+import {
+	buildHandoffUserMessage,
+	clearPendingHandoff,
+	getHandoffMessages,
+	HANDOFF_SYSTEM_PROMPT,
+	readPendingHandoff,
+	resolveGeneratorModel,
+	writePendingHandoff,
+	type HandoffEntry,
+} from "./handoff.ts";
 import { autoCompactionThresholdPercent, digestBranch, formatStatus } from "./status.ts";
 import { reminderText } from "./reminders.ts";
 import {
@@ -47,6 +65,15 @@ import {
 interface PendingCompaction {
 	preserve: string;
 	reason?: string;
+	requestedAt: number;
+}
+
+/** A handoff requested via the handoff_session tool, awaiting the run boundary. */
+interface PendingHandoff {
+	focus: string;
+	reason?: string;
+	/** Opt into the LLM summarizer instead of using `focus` verbatim. */
+	generate?: boolean;
 	requestedAt: number;
 }
 
@@ -105,6 +132,8 @@ export default function (pi: ExtensionAPI) {
 	// Session-scoped state. Cleared on session_start; compaction is consumed by the
 	// agent_before_settle handler (approval flow).
 	let pendingCompaction: PendingCompaction | undefined;
+	/** A handoff supersedes a pending compaction when both are requested. */
+	let pendingHandoff: PendingHandoff | undefined;
 	/** Reminder tiers that have already fired (once_per_tier mode). */
 	const firedTiers = new Set<number>();
 	/** JSONL logger, created lazily per session (sessionId is stable within one). */
@@ -210,6 +239,7 @@ export default function (pi: ExtensionAPI) {
 			"Call compact_context when a sub-task has just resolved, or when work is converging and the detail behind you is no longer needed.",
 			"Do NOT call compact_context mid-derivation or while stuck — you may need the working detail you would be summarizing away.",
 			"Prefer prune_context first when stale tool results are the bloat; compact only when structure itself is too large.",
+			"Prefer handoff_session over compact_context at the end of a body of work when the NEXT task is materially different — the new session starts clean instead of carrying summaries.",
 			"compact_context is deferred: it runs at the end of your current run, not immediately. Finish your response after calling it.",
 		],
 		parameters: Type.Object({
@@ -265,6 +295,81 @@ export default function (pi: ExtensionAPI) {
 					},
 				],
 				details: { kind: "success", preserve, reason: params.reason },
+			};
+		},
+	});
+
+	// ---------------------------------------------------------------------------
+	// Agent-initiated handoff to a new session: consumed at the run boundary
+	// ---------------------------------------------------------------------------
+
+	pi.registerTool({
+		name: "handoff_session",
+		label: "Handoff Session",
+		description:
+			"Request a handoff: transfer context to a NEW session with your `focus` text as its starting prompt, instead of compacting the current one. Use at the end of a body of work when the next task is materially different — a fresh session beats carrying compaction summaries across tasks. By default the `focus` is used VERBATIM as the new session's starting prompt (no rewriting) — write it as a complete, self-contained brief: the goal, current work state, relevant files, and the next concrete step. Pass `generate: true` only when the conversation must be summarized into the prompt (e.g. the user gave a one-line goal); the generated version is lossier. Deferred like compaction: it runs when your current run settles, not immediately. The user reviews and edits the handoff prompt before anything happens — cancelling the editor declines the handoff. Requires interactive (TUI) mode.",
+		promptSnippet: "Hand off context to a new session (your focus becomes the prompt; user approves)",
+		promptGuidelines: [
+			"Call handoff_session at the end of a body of work — after a merge gate, a completed task, or when the next task is materially different from the current one.",
+			"Prefer compact_context instead when continuing related work in the same session: a handoff is for a clean start, compaction is for staying.",
+			"The `focus` becomes the new session's starting point VERBATIM — state the goal, current work state, files involved, and the next concrete step, not a narration of the session. Write it fully: nothing will be added by a summarizer.",
+			"handoff_session is deferred and needs user approval: it runs at the end of your current run, and the user must review and submit the handoff prompt. Finish your response normally after calling it.",
+		],
+		parameters: Type.Object({
+			focus: Type.String({
+				description:
+					"What the next session must pick up: the goal, current work state, relevant files, and the next concrete step. Used VERBATIM as the new session's starting prompt, so write it complete and self-contained. The user reviews and can edit it.",
+			}),
+			generate: Type.Optional(
+				Type.Boolean({
+					description:
+						"Opt into generating the prompt with an LLM summary of the conversation instead of using `focus` verbatim. Only pass true when a summary of the conversation itself is needed (lossier, can truncate detail).",
+				}),
+			),
+			reason: Type.Optional(
+				Type.String({ description: "One line on why a new session is better than continuing or compacting (shown to the user)." }),
+			),
+		}),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			if (signal?.aborted) {
+				return { content: [{ type: "text", text: "Aborted." }], details: { kind: "aborted" } };
+			}
+
+			const focus = params.focus.trim();
+			if (!focus) {
+				return {
+					content: [{ type: "text", text: "The `focus` parameter is empty — state what the next session must pick up." }],
+					details: { kind: "validation-error" },
+					isError: true,
+				};
+			}
+
+			// Only the latest request is kept — the model should not stack handoffs.
+			pendingHandoff = {
+				focus,
+				reason: params.reason?.trim() || undefined,
+				generate: params.generate === true,
+				requestedAt: Date.now(),
+			};
+
+			const usage = ctx.getContextUsage();
+			log(ctx, "handoff_requested", {
+				reason: params.reason?.trim() || null,
+				focusLength: focus.length,
+				generate: params.generate === true,
+				percent: usage?.percent ?? null,
+			});
+
+			return {
+				content: [
+					{
+					type: "text",
+					text: params.generate
+						? "Handoff requested with your focus. It will run when this run settles (not immediately) — finish your current response normally. A summarizer will draft the prompt from the conversation and your focus; the user will review and edit it, a new session opens with it as a draft, and the user submits it when ready."
+						: "Handoff requested with your focus. It will run when this run settles (not immediately) — finish your current response normally. Your focus text becomes the new session's starting prompt VERBATIM; the user will review and can edit it, a new session opens with it as a draft, and the user submits it when ready.",
+				},
+			],
+				details: { kind: "success", focus, reason: params.reason },
 			};
 		},
 	});
@@ -471,12 +576,148 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
+	/** Generate the handoff prompt and get user approval in the editor. Returns the approved prompt, or undefined after telling the agent why not. */
+	async function generateAndApproveHandoff(ctx: ExtensionContext, request: PendingHandoff): Promise<string | undefined> {
+		// The editor gate and the new-session draft are inherently interactive.
+		// Headless modes cannot hand off — compaction remains available there.
+		if (!ctx.hasUI || ctx.mode !== "tui") {
+			log(ctx, "handoff_unavailable", { reason: "non-tui" });
+			sendNotice(
+				"Handoff declined: it requires interactive mode (the user must review the handoff prompt before the new session opens). Use compact_context instead, or let the user start the next session.",
+				{ triggerTurn: true },
+			);
+			return undefined;
+		}
+
+		// Verbatim mode (default): the agent's focus IS the handoff prompt. The
+		// agent writes it with full live context and the tool schema demands it be
+		// self-contained — a second LLM call can only shorten or re-interpret it.
+		if (request.reason) ctx.ui.notify(`Handoff requested — agent's reason: ${request.reason}`, "info");
+		if (!request.generate) {
+			return approveHandoffPrompt(ctx, request.focus, "verbatim");
+		}
+
+		const branch = ctx.sessionManager.getBranch() as HandoffEntry[];
+		const messages = getHandoffMessages(branch);
+		if (messages.length === 0) {
+			log(ctx, "handoff_unavailable", { reason: "empty-branch" });
+			sendNotice("Handoff declined: there is no conversation to hand off.", { triggerTurn: true });
+			return undefined;
+		}
+
+		// Generate on the physical model behind the latest assistant response —
+		// under a virtual model (dyna/auto), ctx.model names the virtual selection,
+		// which modelRegistry.complete cannot dispatch to.
+		const modelSpec = resolveGeneratorModel(branch);
+		const model = modelSpec ? ctx.modelRegistry.find(modelSpec.provider, modelSpec.modelId) : undefined;
+		if (!model) {
+			log(ctx, "handoff_unavailable", { reason: "no-generator-model", modelSpec: modelSpec ?? null });
+			sendNotice(
+				"Handoff declined: no physical model was found to generate the handoff prompt. Let the user start the next session.",
+				{ triggerTurn: true },
+			);
+			return undefined;
+		}
+
+		const conversationText = serializeConversation(convertToLlm(messages as Parameters<typeof convertToLlm>[0]));
+
+		// Generate with a cancellable loader, exactly like pi's own handoff example.
+		const generated = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+			const loader = new BorderedLoader(tui, theme, `Generating handoff prompt...`);
+			loader.onAbort = () => done(null);
+
+			const doGenerate = async () => {
+				const response = await ctx.modelRegistry.complete(
+					model,
+					{
+						systemPrompt: HANDOFF_SYSTEM_PROMPT,
+						messages: [buildHandoffUserMessage(conversationText, request.focus)],
+					},
+					{ signal: loader.signal, cacheRetention: "none", sessionId: uuidv7() },
+				);
+				if (response.stopReason === "aborted") return null;
+				return response.content
+					.filter((c): c is { type: "text"; text: string } => c.type === "text")
+					.map((c) => c.text)
+					.join("\n");
+			};
+
+			doGenerate()
+				.then(done)
+				.catch((err) => {
+					log(ctx, "handoff_failed", { error: String(err) });
+					done(null);
+				});
+
+			return loader;
+		});
+
+		if (generated === null) {
+			log(ctx, "handoff_cancelled", { stage: "generation" });
+			ctx.ui.notify("Handoff cancelled", "info");
+			sendNotice("The handoff was cancelled before the prompt was generated. Nothing has changed — the session continues.", { triggerTurn: true });
+			return undefined;
+		}
+
+		return approveHandoffPrompt(ctx, generated, "generated");
+	}
+
+	/** The approval gate: the user reviews and edits the handoff prompt in the editor. Cancelling the editor declines the handoff entirely. */
+	async function approveHandoffPrompt(ctx: ExtensionContext, prompt: string, mode: "verbatim" | "generated"): Promise<string | undefined> {
+		const edited = await ctx.ui.editor("Edit handoff prompt", prompt);
+		if (edited === undefined) {
+			log(ctx, "handoff_declined", { mode });
+			ctx.ui.notify("Handoff declined — the agent will be told", "warning");
+			sendNotice(
+				"The user DECLINED the handoff to a new session. Do not immediately re-request it. Either continue in this session (consider compact_context or prune_context for pressure) or ask the user how they want to proceed.",
+				{ triggerTurn: true },
+			);
+			return undefined;
+		}
+
+		log(ctx, "handoff_approved", { mode, editedLength: edited.length, generatedLength: prompt.length });
+		return edited;
+	}
+
+	/** Execute an approved handoff: switch to a new session with the prompt as a draft. Command context only. */
+	async function executeHandoff(ctx: ExtensionCommandContext, prompt: string, parentSession: string | undefined) {
+		await ctx.newSession({
+			parentSession,
+			withSession: async (replacementCtx) => {
+				replacementCtx.ui.setEditorText(prompt);
+				replacementCtx.ui.notify("Handoff ready. Submit when ready.", "info");
+			},
+		});
+	}
+
 	pi.on("agent_before_settle", async (_event, ctx) => {
-		// Compaction approval + execution at the boundary. Prune edits no
-		// longer pass through here: they are applied mid-run by the
-		// prune_context handler (see PRUNING_DESIGN.md Appendix A), so by the
-		// time this fires they are already persisted on the branch — the
-		// summarizer sees tombstones, not stale content, with no deferral.
+		// Handoff + compaction approval + execution at the boundary. A requested
+		// handoff supersedes a pending compaction: the new session makes
+		// compacting the old one moot. Prune edits no longer pass through here:
+		// they are applied mid-run by the prune_context handler (see
+		// PRUNING_DESIGN.md Appendix A), so by the time this fires they are
+		// already persisted on the branch — the summarizer sees tombstones, not
+		// stale content, with no deferral.
+		const handoff = pendingHandoff;
+		pendingHandoff = undefined;
+		if (handoff) {
+			pendingCompaction = undefined;
+			const approved = await generateAndApproveHandoff(ctx, handoff);
+			if (approved !== undefined) {
+				// Session control (newSession) is command-context only in pi's extension
+				// API, so the switch itself happens through the /handoff command. Park
+				// the approved prompt where it can pick it up; the user runs /handoff.
+				writePendingHandoff(getAgentDir(), {
+					sessionFile: ctx.sessionManager.getSessionFile() ?? undefined,
+					prompt: approved,
+					focus: handoff.focus,
+					createdAt: Date.now(),
+				});
+				ctx.ui.notify("Handoff approved and parked. Run /handoff to open the new session.", "info");
+			}
+			return undefined;
+		}
+
 		const request = pendingCompaction;
 		pendingCompaction = undefined;
 		if (!request) {
@@ -674,6 +915,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		pendingCompaction = undefined;
+		pendingHandoff = undefined;
 		firedTiers.clear();
 		sessionStats = emptyStats();
 		logger = undefined;
@@ -708,6 +950,41 @@ export default function (pi: ExtensionAPI) {
 	// ---------------------------------------------------------------------------
 	// User commands
 	// ---------------------------------------------------------------------------
+
+	pi.registerCommand("handoff", {
+		description:
+			"Open a new session with a handoff prompt. With no args: execute the agent's approved handoff if one is parked. With a goal: generate a fresh handoff prompt from this session, review it, then switch.",
+		handler: async (args, ctx) => {
+			const parked = readPendingHandoff(getAgentDir());
+			const goal = args.trim();
+
+			if (!goal && parked) {
+				clearPendingHandoff(getAgentDir());
+				log(ctx, "handoff_executed", { fromAgent: true, createdAt: parked.createdAt });
+				await executeHandoff(ctx, parked.prompt, parked.sessionFile);
+				return;
+			}
+
+			if (!goal) {
+				ctx.ui.notify(
+					parked
+							? "Usage: /handoff <goal> (an approved handoff from the agent is parked — run /handoff with no arguments to execute it)"
+							: "Usage: /handoff <goal for the new session>",
+					"warning",
+				);
+				return;
+			}
+
+			// Manual flow: generate from the stated goal, review, switch.
+			// A parked agent handoff is superseded by the manual one.
+			if (parked) clearPendingHandoff(getAgentDir());
+			// A goal is a one-liner, not a finished brief — it needs the summarizer.
+			const approved = await generateAndApproveHandoff(ctx, { focus: goal, generate: true, requestedAt: Date.now() });
+			if (approved === undefined) return; // the user was told why
+			log(ctx, "handoff_executed", { fromAgent: false });
+			await executeHandoff(ctx, approved, ctx.sessionManager.getSessionFile());
+		},
+	});
 
 	pi.registerCommand("context-status", {
 		description: "Show current context usage and what is in context",
